@@ -1,1005 +1,594 @@
-# Lab 08: Copying Files and Directories — `cp`, `cp -R`, `cp -a`
+# Lab: Copying Files and Directories — `cp`, `cp -R`, `cp -a`
 
-**Series:** File Operations & Shell Fundamentals · **Lab 8 of the Novice → RHCA path**  
-**Certifications covered:** RHCSA EX200 (Tasks 11, 16, 18, 20), RHCE EX294 (Ansible `copy` module), CKA (`/etc/kubernetes/*`, kubeconfig backups), RHCA building blocks (RH342, RH358, RH318)  
-**Prerequisite:** Labs 05–07  
-**Time Estimate:** 40–55 minutes  
-**Difficulty arc:** Tasks 1–6 foundation · 7–13 practical · 14–18 advanced · 19–20 exam-realistic
-
----
-
-## 🎯 Objective
-
-Master `cp` and its three workhorse modes: single-file copy, recursive copy with `-R`, and **archive** copy with `-a` that preserves everything (ownership, timestamps, permissions, symlinks, ACLs, and SELinux contexts). Choosing the wrong flag silently breaks services on the exam — Apache, sshd, MariaDB all expect specific metadata.
+**Series:** linux-ops-mastery — RHCSA Essential Tools & File Operations
+**Subjects covered:** `cp` for single-file copy, `-R`/`-r` for recursive directory copy, `-a` "archive" mode (preserves owner, group, mode, timestamps, symlinks, SELinux context), `-i` interactive overwrite prompts, `-n` no-clobber, `-u` update-only-if-newer, `-v` verbose, `-p` preserve mode/owner/timestamps, `--preserve=context` for SELinux, the difference between `cp -R src dst/` and `cp -R src/. dst/`, the trailing-slash gotcha, and the production reflex of "use `-a` unless you have a reason not to"
+**Career arcs covered:** RHCSA (every "copy this config to that location" task), RHCE (Ansible `copy:` module — same semantics), SRE (backup snapshots before changes), DevOps (Dockerfile `COPY` inherits from cp semantics), AI/MLOps (dataset / checkpoint replication across nodes)
+**Prerequisite:** Labs 05–07 (navigation, listing, timestamps)
+**Time Estimate:** 30 to 45 minutes
+**Difficulty arc:** Task 1 foundation (single-file copy) · 2 recursive copy · 3 the `-a` preserve-everything pattern · 4 interactive/no-clobber/update flags · 5 the trailing-slash and `src/.` tricks · 6 RHCSA exam-realistic capstone
 
 ---
 
-## 🧠 Concept: A Copy Is a New Inode
+## Objective
 
-Unlike a hard link, `cp` creates a **brand-new inode** with **new data blocks**. By default, the new file inherits **fresh** metadata:
+Copy files and directories without losing metadata, without overwriting things you did not mean to, and without falling into the "did I copy the directory or only its contents?" trap. By the end of this lab you can perform any RHCSA-style copy task in two seconds — and you understand exactly why `-a` is the senior-engineer default.
 
-| Attribute | Default `cp` behavior | With `-a` |
+The capstone is an exam-realistic prompt: *"Make a complete backup of `/etc/ssh/` to `/root/ssh-backup/` such that every file's owner, group, mode, timestamps, and SELinux context are preserved exactly. Verify by comparing one host key's metadata between source and destination."*
+
+> **Lab safety note:** Every command in this lab reads from `/etc/ssh` and your sandbox under `/tmp/cp-lab`, and writes only into `/tmp/cp-lab` or `/root/...`. No system file is modified.
+
+---
+
+## Concept: A Copy Is a Choice About Metadata
+
+The bytes of a file are easy to copy. The **metadata** is where copies get interesting:
+
+| Metadata | Default `cp` preserves? | `cp -p` preserves? | `cp -a` preserves? |
+|---|---|---|---|
+| File contents | yes | yes | yes |
+| Mode (permissions) | no (uses umask) | yes | yes |
+| Owner / group | no (current user) | yes (if root) | yes (if root) |
+| mtime | no (now) | yes | yes |
+| atime | no (now) | yes | yes |
+| ctime | no (now — kernel always sets) | no | no |
+| Symlinks | followed (target copied) | followed | preserved as symlinks |
+| Hard links | broken (two independent copies) | broken | preserved |
+| SELinux context | no (inherits destination) | no | yes |
+| ACLs | no | no | yes |
+| Extended attributes | no | no | yes |
+
+```
+   ┌──────────────────────────────────────────────────────┐
+   │                cp source dest                        │
+   ├──────────────────────────────────────────────────────┤
+   │  default   → bytes only; new inode; new metadata     │
+   │  cp -p     → bytes + mode/owner/group/times          │
+   │  cp -R/-r  → recurse into directories                │
+   │  cp -a     → -dR --preserve=all   (the everything)   │
+   └──────────────────────────────────────────────────────┘
+```
+
+> **Why this matters:** On the RHCSA exam, the prompt almost always says "preserve" or "with original permissions" or "as a backup." Each of those words is a hint to reach for `-a` instead of `-r`. Using the wrong flag silently loses metadata, and the grader checks the result.
+
+---
+
+## 📜 Why `cp -a` Exists — The Story
+
+In **Unix v1 (1971)** `cp` did one job: copy bytes. Metadata? Use `chmod`, `chown`, `touch` separately. As Unix matured into a multi-user system, "make a backup of `/etc`" became a nightly chore — and the manual sequence "copy then chmod then chown then touch" became an error-prone ritual.
+
+The Berkeley team responded with `-p` (preserve), shipped in **4.3 BSD (1986)**, which preserved owner/group/mode/timestamps in one operation. GNU coreutils later added `-d` (preserve symlinks), `--preserve=context` (SELinux), and finally `-a` (archive — equivalent to `-dR --preserve=all`) to combine every "do the right thing for a backup" flag into one letter.
+
+So `cp -a` is the result of 35 years of "I forgot to preserve X." It is the convergent answer to "what do I want when I copy a directory tree for safekeeping?" The answer is **everything**.
+
+> **The point of the story:** Default `cp` is the "give me a clean copy with the current user's defaults" tool. `cp -a` is the "treat this as a backup" tool. Pick the right one for the job.
+
+---
+
+## 👪 The cp Family — Who Lives There
+
+### Common flags
+
+| Flag | Meaning |
+|---|---|
+| `-r` / `-R` | Recursive (required for directories) |
+| `-i` | Interactive — prompt before overwrite |
+| `-n` | No-clobber — skip if destination exists |
+| `-f` | Force overwrite (default) |
+| `-u` | Update only — copy only if source is newer or destination missing |
+| `-v` | Verbose — print each copy |
+| `-p` | Preserve mode, owner, group, timestamps |
+| `--preserve=mode,owner,group,timestamps,links,context,xattr,all` | Granular preserve |
+| `-a` | Archive — `-dR --preserve=all` (the everything) |
+| `-l` | Hard-link instead of copy (when possible) |
+| `-s` | Make symlink instead of copy |
+| `-L` | Follow symlinks in source |
+| `-P` | Never follow symlinks (preserve as symlinks) |
+| `-d` | `-P --preserve=links` (preserve symlinks and hardlinks) |
+| `-t TARGET` | Specify destination first (so source args can be repeated/scripted) |
+| `-T` | Treat destination as a file, not a directory |
+
+### Related commands
+
+| Command | Notes |
+|---|---|
+| `mv` | Rename / move (no metadata to copy, just rename) |
+| `rsync -a` | Same idea as `cp -a` but resumable, networked, with `--delete` |
+| `install -m MODE` | Copy with explicit mode; common in Makefiles |
+| `tar c ... \| tar x ...` | Old-school metadata-preserving copy |
+| `cpio -p` | The original "copy preserving everything" — predates `cp -a` |
+
+> **The point of the family tree:** For RHCSA, `cp` + `-a`/`-r` covers everything. For multi-machine work, `rsync -a`. For "build artifacts," `install`. For one-time archive operations, `tar`.
+
+---
+
+## 🔬 The Anatomy of a Copy — In One Diagram
+
+```
+$ cp -a /etc/ssh /root/ssh-backup
+       │       │ │
+       │       │ └─ destination — a directory (will be CREATED if missing, or used as PARENT if exists)
+       │       └─ source — a directory
+       └─ -a flag = -dR --preserve=all
+
+What the shell + cp actually do:
+  1. stat the source to learn its type and metadata.
+  2. If dest does not exist, create it (mkdir).
+  3. For each entry in source:
+       - regular file  → read source bytes, write to dest/name, copy metadata
+       - directory     → recurse
+       - symlink (-d)  → preserve as symlink, do NOT follow
+       - hardlink (-d) → preserve the link count
+  4. Apply final metadata (timestamps last so they are not bumped by writes).
+
+Trailing-slash trap:
+  cp -a src  dst    → if dst exists, places src AS dst/src
+                       (final layout: dst/src/...)
+  cp -a src/ dst    → SAME behavior as above (trailing / on src has no effect in cp)
+  cp -a src/. dst   → copies the CONTENTS of src into dst (no extra level)
+  cp -aT src  dst   → forces "treat dst as a file" — copies CONTENTS, dst becomes "src"
+```
+
+> **Reading rule:** The position of the slash on the **destination** rarely matters; the difference between `src` and `src/.` on the **source** is what controls whether you get `dst/src/...` or `dst/...`.
+
+---
+
+## 📚 cp Reference Table
+
+| Task | Command | Notes |
 |---|---|---|
-| Inode | New | New |
-| Data | Copied | Copied |
-| Owner | The **caller** (`whoami`) | **Preserved** from source |
-| Group | Caller's primary group | **Preserved** from source |
-| Mode | Source mode AND-ed with umask | **Preserved** exactly |
-| atime/mtime | Set to **now** | **Preserved** |
-| Symlinks | **Dereferenced** (file copied) | **Preserved as links** |
-| SELinux context | Inherited from **target directory** | **Preserved** with `--preserve=context` |
-| ACLs | Lost | **Preserved** with `--preserve=xattr,all` |
+| Single-file copy | `cp /etc/hosts /tmp/hosts.bak` | Loses mode/owner/timestamps |
+| Single-file with preservation | `cp -p /etc/hosts /tmp/hosts.bak` | Preserves mode/owner/times |
+| Directory copy | `cp -r /etc/ssh /tmp/ssh.bak` | Recursive |
+| Archive copy (recommended) | `cp -a /etc/ssh /tmp/ssh.bak` | Preserves everything |
+| Copy contents (not the dir itself) | `cp -a /etc/ssh/. /tmp/ssh-contents/` | Use `/.` on source |
+| Verbose | `cp -av /etc/ssh /tmp/ssh.bak` | Prints each copy |
+| Interactive (prompt before clobber) | `cp -i a b` | Y/N per overwrite |
+| No-clobber | `cp -n a b` | Skip if dest exists |
+| Update-only-if-newer | `cp -u src dst` | Diff by mtime |
+| Force overwrite | `cp -f a b` | Default; rarely needed |
+| Multiple sources, one target dir | `cp f1 f2 f3 /target/` | Target must be a dir (or use `-t`) |
+| Specify target first (-t form) | `cp -t /target/ f1 f2 f3` | Script-friendly |
+| Make a hard link instead | `cp -l a b` | Same inode |
+| Make a symlink instead | `cp -s a b` | Soft link |
+| Preserve SELinux only | `cp --preserve=context a b` | Without `-a` |
+| Preserve owner only | `cp --preserve=owner a b` | Needs root for owner change |
 
-> **Why this matters on RHCSA Task 16:** Move `/var/www/html` content with plain `cp` and the new files inherit the **wrong** SELinux type — Apache returns 403. Use `cp -a` plus `restorecon`, or `cp -aZ`.
-
-### Diagram: what happens when you cp
-
-```
-  cp src dst
-    │
-    ├── allocate new inode in dst's filesystem
-    ├── copy data blocks
-    ├── set metadata (default: caller's, target dir's context)
-    └── done
-
-  cp -a src dst  (archive)
-    │
-    ├── allocate new inode
-    ├── copy data blocks
-    ├── PRESERVE metadata from source (mode, owner, times, context, links)
-    └── done
-```
+> **Rule one of cp:** When in doubt, `cp -a` and verify. The flag costs nothing extra; missing metadata costs you the grade or the incident.
 
 ---
 
-## 📚 `cp` Reference
+## 🎯 Career Pathway Sidebar
 
-| Flag | Long form | Purpose |
-|---|---|---|
-| `-r` / `-R` | `--recursive` | Copy directories recursively |
-| `-a` | `--archive` | `-dR --preserve=all` — preserve everything |
-| `-i` | `--interactive` | Prompt before overwrite |
-| `-n` | `--no-clobber` | Never overwrite an existing file |
-| `-f` | `--force` | Remove unwritable destination first |
-| `-u` | `--update` | Copy only when source is newer (or dest missing) |
-| `-v` | `--verbose` | Print each file copied |
-| `-p` | `--preserve=mode,ownership,timestamps` | Preserve those three attributes |
-| `--preserve=all` | — | Preserve mode, ownership, timestamps, links, xattr, context |
-| `-d` | — | Preserve symlinks (don't follow) |
-| `-L` | `--dereference` | Always follow symlinks (default for non-`-a`) |
-| `-P` | `--no-dereference` | Never follow symlinks |
-| `-Z` | — | Set destination context to **target dir's default** |
-| `--parents` | — | Recreate the source path under the destination |
-| `--backup[=METHOD]` | — | Make a backup of an existing destination |
-| `-l` | `--link` | Create hard links instead of copying |
-| `-s` | `--symbolic-link` | Create symbolic links instead of copying |
-| `--sparse=WHEN` | — | Control sparse-file handling (`auto`, `always`, `never`) |
-
----
-
-## 🛣️ RHCA Pathway Sidebar
-
-| Cert level | Why this lab matters |
+| Level | Why this lab matters |
 |---|---|
-| **RHCSA EX200** | Tasks 11 (archive), 16 (web deploy), 18 (configs), 20 (rollback copy) |
-| **RHCE EX294** | `ansible.builtin.copy`/`fetch`/`template` mirror `cp` semantics |
-| **CKA** | Backups: kubeconfig, etcd snapshots, CNI configs |
-| **RHCA — RH342** | Pre-change snapshots of `/etc/*.conf` |
-| **RHCA — RH358** | Service-config deployments need correct context |
-| **RHCA — RH318 (Virt)** | `cp --sparse=always` for VM disk images |
+| **RHCSA candidate** | "Copy `/etc/foo` to `/tmp/foo-backup` preserving permissions and contexts" is the canonical exam phrasing. `cp -a` solves it. |
+| **RHCE candidate** | Ansible's `copy:` module mirrors `cp -a` semantics through `mode:`, `owner:`, `group:`, and SELinux relabeling. |
+| **SRE / Platform** | Before any risky config change: `cp -a /etc/sshd_config /root/sshd_config.bak-$(date +%s)`. Roll back with `cp -a` back. |
+| **DevOps** | Dockerfile `COPY src dst` is the build-time analogue. Inside images, `cp -a` is used for layered initialization. |
+| **AI / MLOps** | Dataset replication across NFS or local disks: `cp -a /shared/datasets/v1 /local/scratch/datasets/v1` keeps timestamps so cache-validation scripts work. |
 
 ---
 
-## 🔧 The 20 Tasks
+## 🔧 The 6 Tasks
+
+> Six exam-realistic phases that build the **copy → preserve → verify** habit.
 
 ---
 
-### Task 1 — Set up source and destination
+### Task 1 — Single-file copy with and without `-p`
 
-**Purpose:** Build a realistic test bed with files, subdirs, and a symlink.
+**Purpose:** Build the sandbox, copy a file with default `cp`, then re-copy with `-p`, and prove the difference in metadata.
 
 ```bash
-mkdir -p ~/cp-lab/src ~/cp-lab/dst
-cd ~/cp-lab
-echo "alpha content"  > src/alpha.txt
-echo "beta content"   > src/beta.txt
-mkdir -p src/sub
-echo "deep file"      > src/sub/deep.txt
-ln -s alpha.txt        src/alpha.link
-ls -lR src
+mkdir -p /tmp/cp-lab && cd /tmp/cp-lab
+
+cp /etc/hosts hosts-plain.copy
+ls -l /etc/hosts hosts-plain.copy
+stat -c 'm=%y u=%U g=%G mode=%a' /etc/hosts hosts-plain.copy
+
+cp -p /etc/hosts hosts-preserved.copy
+ls -l /etc/hosts hosts-preserved.copy
+stat -c 'm=%y u=%U g=%G mode=%a' /etc/hosts hosts-preserved.copy
 ```
+
+**Human-Readable Breakdown:** Make the sandbox, copy `/etc/hosts` two ways — plain (no metadata preservation) and `-p` (preserve mode/owner/group/timestamps). Compare the metadata side-by-side.
+
+**Reading it left to right:** Plain `cp` performs a `read()` from the source and `write()` to a freshly created destination — the kernel assigns mtime/atime to **now** and owner/group to the **calling user**. `cp -p` issues a final `chmod`/`chown`/`utimes` to align metadata with the source.
+
+**The story:** This is the experiment that converts you from "cp copies files" to "cp copies bytes; metadata is a choice." Once you have run it, you reach for `-p` (or `-a`) automatically.
 
 **Expected output:**
 
-```
-src:
-total 8
--rw-r--r--. 1 ec2-user ec2-user 14 Sep 12 12:00 alpha.txt
-lrwxrwxrwx. 1 ec2-user ec2-user  9 Sep 12 12:00 alpha.link -> alpha.txt
--rw-r--r--. 1 ec2-user ec2-user 13 Sep 12 12:00 beta.txt
-drwxr-xr-x. 2 ec2-user ec2-user 22 Sep 12 12:00 sub
-
-src/sub:
-total 4
--rw-r--r--. 1 ec2-user ec2-user 10 Sep 12 12:00 deep.txt
+```text
+-rw-r--r--. 1 root     root     158 May 21 14:33 /etc/hosts
+-rw-r--r--. 1 ec2-user ec2-user 158 May 26 13:40 hosts-plain.copy
+m=2026-05-21 14:33:18 u=root g=root mode=644
+m=2026-05-26 13:40:00 u=ec2-user g=ec2-user mode=644
+-rw-r--r--. 1 root     root     158 May 21 14:33 /etc/hosts
+-rw-r--r--. 1 ec2-user ec2-user 158 May 21 14:33 hosts-preserved.copy
+m=2026-05-21 14:33:18 u=root g=root mode=644
+m=2026-05-21 14:33:18 u=ec2-user g=ec2-user mode=644
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `mkdir -p` | Create with missing parents |
-| `echo "X" > file` | Write `X` to file (with newline) |
-| `ln -s` | Create symlink (Lab 09) |
-| `ls -lR` | Long, recursive listing |
-
-**Output decoded**
-
-| Element | Meaning |
-|---|---|
-| `src:` | Directory header |
-| `alpha.link -> alpha.txt` | Symlink that targets the regular file |
-| `src/sub:` | Subdirectory header |
+| `cp SRC DST` | Plain copy |
+| `cp -p SRC DST` | Preserve mode/owner/group/timestamps |
+| `stat -c 'FMT'` | Custom stat output |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `mkdir: cannot create` | Use a path inside your home |
+| Owner did not transfer | You are not root — `-p` can only set owner if you have CAP_CHOWN |
+| mtime is "now" with `-p` | Filesystem may not support setting mtime — rare |
+| Mode differs by `0644` vs `664` | Source file mode was `664` — `-p` preserves it |
 
 ---
 
-### Task 2 — Copy a single file into a directory
+### Task 2 — Recursive directory copy with `-r`
 
-**Purpose:** Most basic case. Source name is preserved at the destination.
+**Purpose:** Use `-r` (or `-R`) to copy a directory tree. Notice that plain `-r` does **not** preserve owner/timestamps/contexts.
 
 ```bash
-cp src/alpha.txt dst/
-ls -l dst/
+cd /tmp/cp-lab
+
+cp -r /etc/ssh ssh-r.copy
+ls -ld ssh-r.copy
+ls -l ssh-r.copy | head -n 5
+stat -c 'mode=%a u=%U g=%G m=%y' ssh-r.copy ssh-r.copy/sshd_config
 ```
+
+**Human-Readable Breakdown:** Recursively copy `/etc/ssh` into the sandbox with `-r`. List the copied directory and one file inside it, then compare metadata against the source.
+
+**Reading it left to right:** `cp -r SRC DST` recurses into SRC's directories. For each file, the default (no preservation) applies — owner becomes you, timestamps become now, mode obeys your umask combined with source mode.
+
+**The story:** Most beginners learn `cp -r` and think they have done a backup. They have copied bytes, not state. The metadata loss only shows up later — when SSH refuses to use the host key because permissions are too open, or when `find -mtime` returns no results because everything has the same recent mtime.
 
 **Expected output:**
 
-```
--rw-r--r--. 1 ec2-user ec2-user 14 Sep 12 12:05 alpha.txt
+```text
+drwxr-xr-x. 4 ec2-user ec2-user 175 May 26 13:42 ssh-r.copy
+-rw-r--r--. 1 ec2-user ec2-user 4434 May 26 13:42 sshd_config
+-rw-r--r--. 1 ec2-user ec2-user 1872 May 26 13:42 ssh_config
+...
+mode=755 u=ec2-user g=ec2-user m=2026-05-26 13:42:00
+mode=644 u=ec2-user g=ec2-user m=2026-05-26 13:42:00
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `cp src dst` | Source then destination |
-| `dst/` | Trailing `/` → destination is a directory (explicit) |
-
-**Output decoded**
-
-| Column | Meaning |
-|---|---|
-| `-rw-r--r--.` | Default mode (umask applied) |
-| `Sep 12 12:05` | mtime = **now** (no `-a`, so timestamps are fresh) |
-| `alpha.txt` | Name preserved at destination |
+| `cp -r SRC DST` | Recursive copy |
+| `cp -R SRC DST` | Same as `-r` (POSIX form) |
+| `ls -ld DIR` | Long-list the directory itself |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `cp: target 'dst/' is not a directory` | `dst/` doesn't exist — `mkdir -p dst/` first |
+| `cp: -r not specified; omitting directory '/etc/ssh'` | Add `-r` |
+| Permission denied reading host key files | Run as root (`sudo cp -r ...`) — keys are mode 0600 root-only |
+| Owner is wrong | Use `-p` or `-a` (and run as root) |
 
 ---
 
-### Task 3 — Copy AND rename in one step
+### Task 3 — Archive copy with `-a` (the everything)
 
-**Purpose:** Saves a separate `mv` if you want the destination to have a different name.
+**Purpose:** Use `-a` to preserve mode, owner, group, timestamps, symlinks, hard links, ACLs, and SELinux context all at once.
 
 ```bash
-cp src/alpha.txt dst/alpha-renamed.txt
-ls dst/
+sudo -i
+cd /tmp/cp-lab
+
+cp -a /etc/ssh ssh-a.copy
+ls -ldZ ssh-a.copy
+ls -lZ  ssh-a.copy/sshd_config /etc/ssh/sshd_config
+stat -c 'mode=%a u=%U g=%G C=%C m=%y' ssh-a.copy/sshd_config /etc/ssh/sshd_config
 ```
+
+**Human-Readable Breakdown:** Become root. Use `cp -a` to copy `/etc/ssh` with everything preserved. Compare the destination's `sshd_config` against the source — mode, owner, group, SELinux context, and mtime should all match.
+
+**Reading it left to right:** `cp -a` is `-dR --preserve=all`: `-d` preserves symlinks and hardlinks, `-R` recurses, `--preserve=all` keeps mode/owner/group/timestamps/links/context/xattrs. The result is byte-and-metadata identical to the source.
+
+**The story:** Once you have used `-a` and verified the output, you stop typing `-r` for backups. The cost is zero. The benefit is "passes the exam grader, doesn't surprise the daemon."
 
 **Expected output:**
 
-```
-alpha.txt  alpha-renamed.txt
+```text
+drwxr-xr-x. 4 root root system_u:object_r:etc_t:s0 175 May 21 14:33 ssh-a.copy
+-rw-------. 1 root root system_u:object_r:etc_t:s0 4434 May 21 14:33 ssh-a.copy/sshd_config
+-rw-------. 1 root root system_u:object_r:etc_t:s0 4434 May 21 14:33 /etc/ssh/sshd_config
+mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
+mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `cp src dst/newname` | Destination has explicit filename, not a trailing `/` |
+| `cp -a SRC DST` | Archive copy |
+| `--preserve=all` | Same as `-a`'s preservation set |
+| `--preserve=context` | Just SELinux context |
+| `ls -lZ` / `ls -ldZ` | Include SELinux context column |
 
-**Output decoded**
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| Owner did not transfer | Need root (`sudo -i`) |
+| Context shows `default_t` | Filesystem may not support xattrs, or `--preserve=context` failed — verify with `ls -Z` |
+| Symlinks were followed and copied as files | Use `-a` (preserves symlinks), not `-r` |
+
+---
+
+### Task 4 — Safety flags: `-i`, `-n`, `-u`, `-v`
+
+**Purpose:** Practice the four flags that protect you from accidental overwrites and noisy output: `-i` (interactive), `-n` (no-clobber), `-u` (update), `-v` (verbose).
+
+```bash
+cd /tmp/cp-lab
+
+mkdir -p safety && cd safety
+echo "original" > target.txt
+
+# Interactive — prompts before overwrite
+echo "new" > src.txt
+cp -i src.txt target.txt
+# (answer 'n' to keep original, 'y' to overwrite)
+
+# No-clobber — skips silently
+cp -n src.txt target.txt
+cat target.txt
+
+# Update — only overwrites if source is newer
+touch -d "1 hour ago" old-src.txt
+cp -u old-src.txt target.txt
+cat target.txt
+sleep 1
+touch new-src.txt
+cp -u new-src.txt target.txt
+cat target.txt
+
+# Verbose
+cp -v src.txt verbose-result.txt
+```
+
+**Human-Readable Breakdown:** Create a `target.txt`, then try to overwrite it under four different safety regimes. `-i` asks. `-n` silently skips. `-u` overwrites only if the source is newer. `-v` prints each copy operation.
+
+**Reading it left to right:** `-i` causes `cp` to read from stdin before overwriting. `-n` is "no" — the destination already exists, do nothing. `-u` compares mtimes and acts only when the source is strictly newer. `-v` prints `'src' -> 'dst'` for each operation.
+
+**The story:** These are the seatbelts. In production scripts that loop over many files, `-n` prevents disasters when sources and destinations overlap; `-u` provides cheap idempotence; `-v` aids debugging. In interactive use, `-i` is a paranoid safety net that nobody regrets.
+
+**Expected output:**
+
+```text
+cp: overwrite 'target.txt'? n
+original
+original
+                              ← (no change — source older with -u)
+                              ← (new file created)
+'src.txt' -> 'verbose-result.txt'
+```
+
+**Switches**
 
 | Token | Meaning |
 |---|---|
-| `alpha-renamed.txt` | New name at destination |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Wanted both files at destination but only one | Without trailing `/`, the last arg is treated as a target — be explicit |
-
----
-
-### Task 4 — Interactive overwrite with `-i`
-
-**Purpose:** Defense against accidental overwrites.
-
-```bash
-cp -i src/alpha.txt dst/alpha.txt
-```
-
-**Expected interaction:**
-
-```
-cp: overwrite 'dst/alpha.txt'? y
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-i` | Interactive — prompt before each overwrite |
-
-**Output decoded**
-
-| Prompt | Action |
-|---|---|
-| `overwrite 'dst/alpha.txt'?` | Type `y` (yes) or `n` (no) |
-
-**Why a sysadmin needs this:** Many distros alias `cp` to `cp -i` for root only. Type the full command on the exam to be sure.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Got prompt unexpectedly | Your shell has `alias cp='cp -i'` — type `\cp` to bypass once, or unalias |
-
----
-
-### Task 5 — Never overwrite with `-n`
-
-**Purpose:** Idempotent deploys — copy only when destination is missing.
-
-```bash
-echo "I should survive" > dst/alpha.txt
-cp -n src/alpha.txt dst/alpha.txt
-cat dst/alpha.txt
-```
-
-**Expected output:**
-
-```
-I should survive
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-n` | No-clobber — silently skip if destination exists |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `I should survive` | Destination was not overwritten — proves `-n` worked |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Combined `-n -i` | `-n` wins — silent skip, no prompt |
-
----
-
-### Task 6 — Force overwrite with `-f`
-
-**Purpose:** Bypass an alias-induced prompt; remove an unwritable destination before writing.
-
-```bash
-chmod 000 dst/alpha.txt
-cp -f src/alpha.txt dst/alpha.txt
-ls -l dst/alpha.txt
-```
-
-**Expected output:**
-
-```
--rw-r--r--. 1 ec2-user ec2-user 14 Sep 12 12:10 dst/alpha.txt
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-f` | Force — remove destination first if it can't be opened |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| New mode `-rw-r--r--.` | `cp` removed the unwritable target and created a new one with default mode |
-
-**Why a sysadmin needs this:** Production scripts that overwrite read-only flag files.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Still `Permission denied` | `-f` doesn't bypass directory perms — fix the parent's mode |
-
----
-
-### Task 7 — Recursive copy with `-r`
-
-**Purpose:** Whole directory trees. Without `-r`, `cp` refuses directories.
-
-```bash
-rm -rf dst/*
-cp -r src dst/
-ls -lR dst/
-```
-
-**Expected output:**
-
-```
-dst/:
-drwxr-xr-x. 3 ec2-user ec2-user 78 Sep 12 12:10 src
-
-dst/src:
--rw-r--r--. 1 ec2-user ec2-user 14 Sep 12 12:10 alpha.txt
--rw-r--r--. 1 ec2-user ec2-user 13 Sep 12 12:10 alpha.link
--rw-r--r--. 1 ec2-user ec2-user 13 Sep 12 12:10 beta.txt
-drwxr-xr-x. 2 ec2-user ec2-user 22 Sep 12 12:10 sub
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-r` / `-R` | Recursive — same behavior; `-R` is POSIX-correct |
-
-**Output decoded**
-
-| Observation | Meaning |
-|---|---|
-| `dst/src/` was created | `cp -r src dst/` puts a copy of `src` **inside** `dst` |
-| `alpha.link` is now a **regular file** | `-r` followed the symlink |
-| Timestamps say `Sep 12 12:10` | Set to **now** (not preserved) |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `omitting directory 'src'` without `-r` | Add `-r` |
-
----
-
-### Task 8 — The `src` vs `src/.` distinction
-
-**Purpose:** Critical for "copy CONTENTS into target, not the dir itself."
-
-```bash
-rm -rf dst/*
-cp -r src/. dst/
-ls dst/
-```
-
-**Expected output:**
-
-```
-alpha.link  alpha.txt  beta.txt  sub
-```
-
-**Patterns table**
-
-| Pattern | Result |
-|---|---|
-| `cp -r src dst/` | `dst/src/...` |
-| `cp -r src/. dst/` | `dst/...` (contents directly inside dst) |
-| `cp -r src/* dst/` | Same as above but **misses dotfiles** — be careful |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `alpha.txt` is directly in `dst/` | `src/.` told cp to copy the contents, not the dir |
-
-**Why a sysadmin needs this on RHCSA Task 16:** "Move web content to `/var/www/html`" — usually means contents, not the parent dir.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Dotfiles missed with `*` | Use `src/.` form, or enable dotglob: `shopt -s dotglob` |
-
----
-
-### Task 9 — Archive mode: `cp -a`
-
-**Purpose:** The single most important `cp` flag for RHCSA/RHCE/CKA. Preserves everything.
-
-```bash
-rm -rf dst/*
-cp -a src dst/
-ls -l dst/src/
-```
-
-**Expected output:**
-
-```
--rw-r--r--. 1 ec2-user ec2-user 14 Sep 12 12:00 alpha.txt
-lrwxrwxrwx. 1 ec2-user ec2-user  9 Sep 12 12:00 alpha.link -> alpha.txt
--rw-r--r--. 1 ec2-user ec2-user 13 Sep 12 12:00 beta.txt
-drwxr-xr-x. 2 ec2-user ec2-user 22 Sep 12 12:00 sub
-```
-
-**Switches — what's inside `-a`**
-
-| Flag inside `-a` | Preserves |
-|---|---|
-| `-d` | Symlinks (don't follow) |
-| `-R` | Recurse |
-| `--preserve=mode` | Permissions |
-| `--preserve=ownership` | User and group |
-| `--preserve=timestamps` | atime, mtime |
-| `--preserve=links` | Hard-link relationships |
-| `--preserve=context` | SELinux contexts |
-| `--preserve=xattr` | Extended attributes (includes ACLs) |
-
-**Output decoded**
-
-| Element | Meaning |
-|---|---|
-| `alpha.link` | **Still a symlink** (preserved) |
-| `Sep 12 12:00` | Original mtime kept (not "now") |
-| Permissions, owner, group | Exact copies |
-
-> **Memorize this:** **`cp -a` is the safe default for anything under `/etc`, `/var/www`, `/var/lib/<service>`.**
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Ownership not preserved | You need root for owner change across users — `sudo cp -a` |
-
----
-
-### Task 10 — Verify SELinux context preservation
-
-**Purpose:** `cp -a` keeps the source's SELinux type. Plain `cp` inherits target dir's type.
-
-```bash
-ls -Z src/alpha.txt dst/src/alpha.txt
-cp src/alpha.txt /tmp/alpha.txt
-ls -Z src/alpha.txt /tmp/alpha.txt
-```
-
-**Expected output:**
-
-```
-unconfined_u:object_r:user_home_t:s0 src/alpha.txt
-unconfined_u:object_r:user_home_t:s0 dst/src/alpha.txt
-unconfined_u:object_r:user_home_t:s0 src/alpha.txt
-unconfined_u:object_r:user_tmp_t:s0  /tmp/alpha.txt
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-Z` (on ls) | Show SELinux context |
-
-**Output decoded**
-
-| Row | Meaning |
-|---|---|
-| Both `dst/src/alpha.txt` rows match `src` | `cp -a` preserved context ✓ |
-| `/tmp/alpha.txt` shows `user_tmp_t` | Plain `cp` inherited `/tmp`'s default — wrong for service deploys |
-
-**Why a sysadmin needs this on RHCSA Task 16:** Plain `cp` → Apache 403. `cp -a` + `restorecon` → 200.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Both same | Both source and target dir share the type — not always wrong |
-
----
-
-### Task 11 — Apply target context with `-Z`
-
-**Purpose:** Sometimes you WANT the destination to take its directory's default context (e.g., deploying into `/var/www/html`).
-
-```bash
-cp -Z src/alpha.txt /tmp/alpha-Z.txt
-ls -Z /tmp/alpha-Z.txt
-```
-
-**Expected output:**
-
-```
-unconfined_u:object_r:user_tmp_t:s0 /tmp/alpha-Z.txt
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-Z` | Set destination context to the **default for the target directory** (think: inline `restorecon`) |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `user_tmp_t` | Target's default — different from source's `user_home_t` |
-
-**Decision summary**
-
-| Goal | Flag |
-|---|---|
-| Preserve source context | `cp -a` or `cp --preserve=context` |
-| Apply target dir's default | `cp -Z` |
-| Recompute from policy | `cp` (plain), then `restorecon -Rv <path>` |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `-Z` ignored | Old coreutils — use `restorecon` separately |
-
----
-
-### Task 12 — Verbose with `-v`
-
-**Purpose:** See exactly what `cp` did. Indispensable for batch jobs.
-
-```bash
-cp -av src dst/verbose-copy
-```
-
-**Expected output:**
-
-```
-'src' -> 'dst/verbose-copy'
-'src/alpha.txt' -> 'dst/verbose-copy/alpha.txt'
-'src/alpha.link' -> 'dst/verbose-copy/alpha.link'
-'src/beta.txt' -> 'dst/verbose-copy/beta.txt'
-'src/sub' -> 'dst/verbose-copy/sub'
-'src/sub/deep.txt' -> 'dst/verbose-copy/sub/deep.txt'
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-a` | Archive (preserve everything) |
-| `-v` | Verbose — print every operation |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `'src/...' -> 'dst/verbose-copy/...'` | Each source → destination pair |
-
-**Why a sysadmin needs this:** On the exam, `-v` gives you instant proof during demos.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Too much output | Pipe through `tail -20` or filter with `grep` |
-
----
-
-### Task 13 — Update-only with `-u`
-
-**Purpose:** Copy only when source is newer. Useful in sync-style scripts.
-
-```bash
-echo "newer content" > src/alpha.txt
-cp -uv src/alpha.txt dst/src/alpha.txt
-echo "still newer? maybe not" > dst/src/alpha.txt
-cp -uv src/alpha.txt dst/src/alpha.txt
-```
-
-**Expected output:**
-
-```
-'src/alpha.txt' -> 'dst/src/alpha.txt'
-(no output the second time — source not newer)
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-u` | Update — copy only when source mtime > destination mtime, or destination missing |
+| `-i` | Interactive overwrite prompt |
+| `-n` | No-clobber |
+| `-u` | Update only if source newer |
 | `-v` | Verbose |
 
-**Output decoded**
-
-| Run | Outcome |
-|---|---|
-| First | Source newer → copied |
-| Second | Destination newer (just edited) → silently skipped |
-
-**Why a sysadmin needs this:** Lightweight sync. For real sync, use `rsync`.
-
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Skipped when expected to copy | mtime drift across timezones — verify with `stat` |
+| `-i` did not prompt | Output is not a TTY (e.g. in a script) — `-i` is suppressed |
+| `-n` silently skipped what you wanted to overwrite | Wrong default — use `-f` or remove `-n` |
+| `-u` did not overwrite a newer source | Verify mtimes with `stat`; clock skew between machines breaks `-u` |
 
 ---
 
-### Task 14 — Backup before overwrite with `--backup`
+### Task 5 — The trailing slash and `src/.` content-copy trick
 
-**Purpose:** Auto-keep a copy of the destination before clobbering.
+**Purpose:** Master the most common confusion in `cp -r`: "do I want the directory itself at the destination, or its contents?"
 
 ```bash
-cp --backup=numbered src/alpha.txt dst/src/alpha.txt
-cp --backup=numbered src/alpha.txt dst/src/alpha.txt
-ls dst/src/
+cd /tmp/cp-lab
+rm -rf foo bar baz qux
+
+mkdir foo
+echo "A" > foo/a.txt
+echo "B" > foo/b.txt
+
+# Case 1 — destination dir exists; cp places SOURCE INSIDE it
+mkdir bar
+cp -a foo bar
+ls -R bar      # -> bar/foo/a.txt
+
+# Case 2 — destination dir does NOT exist; cp makes it WITH source's contents
+cp -a foo baz
+ls -R baz      # -> baz/a.txt   (no extra `foo` level)
+
+# Case 3 — copy CONTENTS of source into existing destination
+mkdir qux
+cp -a foo/. qux
+ls -R qux      # -> qux/a.txt   (contents only — what you usually want)
+
+# Case 4 — force "treat dest as a file" with -T
+mkdir -p one
+echo "X" > one/x.txt
+cp -aT one two
+ls -R two      # -> two/x.txt (same as case 2)
 ```
+
+**Human-Readable Breakdown:** Build a small source tree, then copy it four ways to see what destination layout each one produces. The crucial distinction: when the destination exists, plain `cp -a foo bar` places `foo` inside `bar`; `cp -a foo/. bar` copies only the contents.
+
+**Reading it left to right:** Case 1 — dest exists → cp creates `bar/foo`. Case 2 — dest missing → cp creates `baz` as the new "foo." Case 3 — `foo/.` means "everything inside foo" → qux receives the contents, not the foo level. Case 4 — `-T` forces "destination is the renamed source," even if it already exists.
+
+**The story:** Every `cp -r` bug in production scripts is this gotcha. Watch the layout once with your own hands and you stop guessing.
 
 **Expected output:**
 
-```
-alpha.txt  alpha.txt.~1~  alpha.txt.~2~  alpha.link  beta.txt  sub
-```
+```text
+bar:
+foo
 
-**Switches**
+bar/foo:
+a.txt  b.txt
 
-| Flag | Meaning |
-|---|---|
-| `--backup` (= `existing`) | Backup as `alpha.txt~`, then numbered if more |
-| `--backup=simple` | Always `alpha.txt~` |
-| `--backup=numbered` | `alpha.txt.~1~`, `~2~`, ... |
-| `--backup=none` (default) | No backup |
-| `-b` | Short form of `--backup=existing` |
+baz:
+a.txt  b.txt
 
-**Output decoded**
+qux:
+a.txt  b.txt
 
-| File | Meaning |
-|---|---|
-| `alpha.txt` | The newly copied file |
-| `alpha.txt.~1~` | First backup (the previous content) |
-| `alpha.txt.~2~` | Second backup (from the second `cp`) |
-
-**Why a sysadmin needs this:** Never edit `/etc/*.conf` without a backup. `cp --backup=numbered original` before editing.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Backups not appearing | You may have run with `-n` (no-clobber) — destination was skipped, no backup needed |
-
----
-
-### Task 15 — Recreate source paths with `--parents`
-
-**Purpose:** Copy a deep file while reconstructing its directory chain.
-
-```bash
-mkdir -p ~/cp-lab/landing
-cp --parents src/sub/deep.txt ~/cp-lab/landing/
-ls -lR ~/cp-lab/landing/
-```
-
-**Expected output:**
-
-```
-landing:
-src
-
-landing/src:
-sub
-
-landing/src/sub:
-deep.txt
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `--parents` | Recreate the source's directory chain under destination |
-
-**Output decoded**
-
-| Path | Meaning |
-|---|---|
-| `landing/src/sub/deep.txt` | Full chain preserved |
-
-**Why a sysadmin needs this:** Selective backups that retain directory structure.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `cp: cannot copy a directory ... into itself` | Don't put destination under source |
-
----
-
-### Task 16 — Make hard links instead of copies with `-l`
-
-**Purpose:** "Copy" without using more disk — `cp -l` creates hard links (same inode, no data duplication).
-
-```bash
-mkdir -p ~/cp-lab/hardlink-dst
-cp -l src/alpha.txt ~/cp-lab/hardlink-dst/
-ls -li src/alpha.txt ~/cp-lab/hardlink-dst/alpha.txt
-```
-
-**Expected output (same inode number):**
-
-```
-1048577 -rw-r--r--. 2 ec2-user ec2-user 14 Sep 12 12:00 src/alpha.txt
-1048577 -rw-r--r--. 2 ec2-user ec2-user 14 Sep 12 12:00 /home/ec2-user/cp-lab/hardlink-dst/alpha.txt
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-l` | Hard-link instead of copying |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `1048577` (both rows) | **Same inode** — both names point to one file |
-| Link count `2` | Two names exist for this inode |
-
-**Why a sysadmin needs this:** Snapshot-style backups across a single filesystem — zero extra disk usage.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `cannot create hard link 'cross-fs'` | Hard links can't cross filesystems — use `cp -a` or `ln -s` |
-
----
-
-### Task 17 — Make symlinks instead of copies with `-s`
-
-**Purpose:** Same idea, but cross-filesystem capable. The destination becomes a symlink.
-
-```bash
-mkdir -p ~/cp-lab/symlink-dst
-cp -s "$PWD/src/alpha.txt" ~/cp-lab/symlink-dst/
-ls -l ~/cp-lab/symlink-dst/
-```
-
-**Expected output:**
-
-```
-lrwxrwxrwx. 1 ec2-user ec2-user 31 Sep 12 13:00 alpha.txt -> /home/ec2-user/cp-lab/src/alpha.txt
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-s` | Symbolic-link instead of copying |
-| `$PWD` | Absolute path of current dir (symlinks need absolute targets to survive moves) |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `lrwxrwxrwx.` | First char `l` = symlink |
-| `alpha.txt -> /home/.../alpha.txt` | Points back to the source |
-
-**Why a sysadmin needs this:** Cross-filesystem "logical copy" without duplicating data.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `cp: '...' is not in the same directory` and relative paths break | Use absolute paths with `-s` |
-
----
-
-### Task 18 — Sparse files with `--sparse`
-
-**Purpose:** VM disk images and database files have huge "holes" of zeros. `--sparse=always` makes the copy sparse.
-
-```bash
-truncate -s 100M ~/cp-lab/big_sparse.img
-cp --sparse=always ~/cp-lab/big_sparse.img ~/cp-lab/big_sparse.copy.img
-ls -lh ~/cp-lab/big_sparse*.img
-du -h ~/cp-lab/big_sparse*.img
-```
-
-**Expected output:**
-
-```
--rw-r--r--. 1 ec2-user ec2-user 100M Sep 12 13:10 /home/ec2-user/cp-lab/big_sparse.img
--rw-r--r--. 1 ec2-user ec2-user 100M Sep 12 13:10 /home/ec2-user/cp-lab/big_sparse.copy.img
-0	/home/ec2-user/cp-lab/big_sparse.img
-0	/home/ec2-user/cp-lab/big_sparse.copy.img
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `--sparse=always` | Always treat zero runs as holes |
-| `--sparse=auto` (default) | Detect when likely useful |
-| `--sparse=never` | Allocate every block, even zeros |
-| `truncate -s 100M` | Create a 100 MiB sparse file (no blocks allocated) |
-
-**Output decoded**
-
-| Tool | Reports |
-|---|---|
-| `ls -lh` | Logical size (100M) |
-| `du -h` | **Disk** size (0 — no blocks actually used) |
-
-**Why a sysadmin needs this on RHCA RH318 (Virt):** A 100 GB VM disk on disk takes 100 GB unless sparse — and you have many of them.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Copied disk is huge | Source wasn't sparse — `--sparse=always` re-introduces holes |
-
----
-
-### Task 19 — Combine `cp -a` with `restorecon` for service deploys
-
-**Purpose:** The canonical exam pattern: archive-copy plus context fix.
-
-```bash
-sudo mkdir -p /web-deploy
-sudo cp -av src/. /web-deploy/
-sudo ls -lZ /web-deploy/
-sudo restorecon -Rv /web-deploy
-sudo ls -lZ /web-deploy/
-```
-
-**Expected output (excerpt):**
-
-```
-'src/./alpha.txt' -> '/web-deploy/./alpha.txt'
-'src/./beta.txt' -> '/web-deploy/./beta.txt'
-'src/./alpha.link' -> '/web-deploy/./alpha.link'
-'src/./sub' -> '/web-deploy/./sub'
-'src/./sub/deep.txt' -> '/web-deploy/./sub/deep.txt'
-
--rw-r--r--. 1 ec2-user ec2-user unconfined_u:object_r:user_home_t:s0 ... alpha.txt
-...
-Relabeled /web-deploy/alpha.txt from unconfined_u:object_r:user_home_t:s0 to system_u:object_r:default_t:s0
-...
+two:
+x.txt
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `cp -av` | Archive + verbose |
-| `restorecon -R` | Recompute contexts recursively from policy |
-| `restorecon -v` | Verbose — print every change |
-
-**Output decoded**
-
-| Phase | What happened |
-|---|---|
-| After cp | All files at `/web-deploy/` still labeled `user_home_t` (source's type) |
-| After restorecon | Files relabeled to `/web-deploy`'s policy-defined type |
-
-**Why on RHCSA Task 16:** Without `restorecon`, Apache returns 403. With it, you pass.
+| `cp -a SRC DST` | Standard copy |
+| `cp -a SRC/. DST` | Copy contents only (DST must exist) |
+| `cp -aT SRC DST` | Treat DST as a file/dir to be created with SRC's contents |
+| `rm -rf` | Remove old test data (Lab 11 deep dive) |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `restorecon` says no change | Either source and target dir share type, or no policy defines this path — use `semanage fcontext -a` |
+| Got `bar/foo/...` when expecting `bar/...` | Use `cp -a foo/. bar` |
+| Got `bar/...` when expecting `bar/foo/...` | The dest did not exist; pre-create with `mkdir` |
+| `-T` complains "Not a directory" | Destination exists as a file; remove it first |
 
 ---
 
-### Task 20 — Exam-style scenario
+### Task 6 — Capstone: RHCSA-realistic full-metadata backup
 
-**Task statement (RHCSA-style):** *"Deploy `/home/admin/site/` into `/var/www/html`, preserving ownership/timestamps but with the correct Apache SELinux context. Verify."*
+**Task statement:** *"Make a complete backup of `/etc/ssh/` to `/root/ssh-backup/` such that every file's owner, group, mode, timestamps, and SELinux context are preserved exactly. Verify by comparing `sshd_config` metadata between source and destination."*
+
+**Purpose:** Execute a real exam-style preserved backup end-to-end, then verify metadata.
 
 ```bash
-sudo mkdir -p /home/admin/site
-echo "Hello, RHCSA" | sudo tee /home/admin/site/index.html > /dev/null
-sudo ls -lZ /home/admin/site/index.html
+sudo -i
 
-sudo cp -av /home/admin/site/. /var/www/html/
-sudo restorecon -Rv /var/www/html
-sudo ls -lZ /var/www/html/index.html
+cp -a /etc/ssh /root/ssh-backup
 
-sudo systemctl restart httpd 2>/dev/null || true
-curl -sI http://localhost/ | head -1 2>/dev/null || echo "(httpd not running — skip)"
+ls -ldZ /etc/ssh /root/ssh-backup
+diff -q /etc/ssh/sshd_config /root/ssh-backup/sshd_config
+
+echo "--- source ---"
+stat -c 'mode=%a u=%U g=%G C=%C m=%y' /etc/ssh/sshd_config
+echo "--- backup ---"
+stat -c 'mode=%a u=%U g=%G C=%C m=%y' /root/ssh-backup/sshd_config
+
+test -d /root/ssh-backup && echo "VERIFY: backup directory exists"
+test "$(stat -c '%C' /etc/ssh/sshd_config)" = "$(stat -c '%C' /root/ssh-backup/sshd_config)" \
+  && echo "VERIFY: SELinux contexts match"
+test "$(stat -c '%a' /etc/ssh/sshd_config)" = "$(stat -c '%a' /root/ssh-backup/sshd_config)" \
+  && echo "VERIFY: modes match"
 ```
 
-**Expected output (excerpts):**
+**Human-Readable Breakdown:** Become root, run `cp -a` to clone `/etc/ssh` to `/root/ssh-backup`. Verify with `ls -ldZ`, `diff -q` (no differences), and a side-by-side `stat` of `sshd_config`. The final `test` lines compare specific fields to fail loudly if anything drifted.
 
+**Layer stack you built:**
+
+```text
+/etc/ssh                  ─── original config dir
+   │
+   ▼  cp -a
+/root/ssh-backup          ─── preserved copy
+   ├── identical contents (diff -q empty)
+   ├── identical owner/group (root:root)
+   ├── identical mode (per file)
+   ├── identical mtime (per file)
+   ├── identical SELinux context (etc_t / sshd_key_t)
+   └── symlinks preserved as symlinks (if any)
 ```
-unconfined_u:object_r:admin_home_t:s0 /home/admin/site/index.html
-'/home/admin/site/./index.html' -> '/var/www/html/./index.html'
-Relabeled /var/www/html/index.html from unconfined_u:object_r:admin_home_t:s0 to system_u:object_r:httpd_sys_content_t:s0
--rw-r--r--. 1 root root system_u:object_r:httpd_sys_content_t:s0 14 Sep 12 13:30 /var/www/html/index.html
-HTTP/1.1 200 OK
+
+**The story:** This is the **canonical 60-second exam answer** for any "preserved backup" task. Memorize the spine: `cp -a /src /dst` → `diff -q` for content → `stat -c '%a %U %G %C'` for metadata. The grader script does the same comparison.
+
+**Expected verification output:**
+
+```text
+drwxr-xr-x. 4 root root system_u:object_r:etc_t:s0 175 May 21 14:33 /etc/ssh
+drwxr-xr-x. 4 root root system_u:object_r:etc_t:s0 175 May 21 14:33 /root/ssh-backup
+--- source ---
+mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
+--- backup ---
+mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
+VERIFY: backup directory exists
+VERIFY: SELinux contexts match
+VERIFY: modes match
 ```
-
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| `cp -av /home/admin/site/. /var/www/html/` | Archive (preserve metadata) + verbose; `.` = contents |
-| `restorecon -Rv /var/www/html` | Fix SELinux types to `httpd_sys_content_t` |
-| `ls -lZ` | Verify final state |
-| `curl -sI` | Functional verification — Apache returns 200 |
 
 **Cleanup**
 
 ```bash
-cd ~
-rm -rf ~/cp-lab
-sudo rm -rf /web-deploy /home/admin/site
-sudo rm -f /tmp/alpha.txt /tmp/alpha-Z.txt
+rm -rf /tmp/cp-lab /root/ssh-backup
+exit
 ```
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `403 Forbidden` from curl | Skipped `restorecon` — run it |
-| `httpd` not installed | `sudo dnf install httpd && sudo systemctl enable --now httpd` |
+| Owner is wrong | Need root (`sudo -i`) before running `cp -a` |
+| Mode differs | Used `-r` instead of `-a` — re-run with `-a` |
+| `diff -q` reports differences | Bytes do not match — re-run; verify no edits between |
+| SELinux context wrong | xattrs not preserved on target FS — confirm `xattr` mount option |
 
 ---
 
-## 🔍 `cp` Decision Guide
+## 🔍 cp Decision Guide
 
 ```
-Single file?                                  → cp src dst
-Whole directory?                              → cp -r src dst
-Whole directory + preserve EVERYTHING?        → cp -a src dst
-Copy CONTENTS into target dir?                → cp -a src/. dst/
-Copying INTO a service dir (correct context)? → cp -aZ src dst   OR cp -a + restorecon
-Need to keep existing destination intact?     → cp -n
-Want to be prompted before overwrite?         → cp -i
-Want a backup before overwriting?             → cp --backup=numbered
-Only copy if source is newer?                 → cp -u
-Need to debug what was copied?                → add -v
-Recreate source's directory tree under dst?   → cp --parents
-Hard-link in place of copy (same FS)?         → cp -l
-Symlink in place of copy (any FS)?            → cp -s
-Sparse VM image / large zero-runs?            → cp --sparse=always
+Got files to copy?
+  │
+  ├── "Single file, just the bytes"
+  │       └── ✅ cp src dst
+  │
+  ├── "Single file, preserve metadata"
+  │       └── ✅ cp -p src dst
+  │
+  ├── "Whole directory, just contents"
+  │       └── ✅ cp -r src dst             (loses metadata)
+  │
+  ├── "Whole directory, preserve EVERYTHING (recommended)"
+  │       └── ✅ cp -a src dst
+  │
+  ├── "Copy the CONTENTS of a dir (no extra parent level)"
+  │       └── ✅ cp -a src/. dst/
+  │
+  ├── "Be paranoid about overwrites"
+  │       └── ✅ cp -i src dst             (prompt)
+  │       └── ✅ cp -n src dst             (skip)
+  │       └── ✅ cp -u src dst             (only if newer)
+  │
+  ├── "Bandwidth- or atomicity-sensitive across machines"
+  │       └── ✅ rsync -a src/ host:/dst/
+  │
+  └── "Build artifacts with explicit mode"
+          └── ✅ install -m 0755 src /usr/local/bin/dst
 ```
 
 ---
 
-## ✅ Lab Checklist (20 Tasks)
+## ✅ Lab Checklist (6 Tasks)
 
-- [ ] 01 Set up `~/cp-lab/src` + `~/cp-lab/dst` with files, subdir, symlink
-- [ ] 02 Copy a single file into a directory
-- [ ] 03 Copy and rename in one step
-- [ ] 04 Interactive overwrite with `-i`
-- [ ] 05 Skip overwrite with `-n`
-- [ ] 06 Force overwrite with `-f`
-- [ ] 07 Recursive copy with `-r`
-- [ ] 08 Use `src/.` to copy contents (not dir itself)
-- [ ] 09 Archive mode `cp -a` preserves everything
-- [ ] 10 Compare `cp` vs `cp -a` SELinux context behavior
-- [ ] 11 Apply target context with `-Z`
-- [ ] 12 Verbose audit with `-v`
-- [ ] 13 Update-only with `-u`
-- [ ] 14 Backups with `--backup=numbered`
-- [ ] 15 Reconstruct paths with `--parents`
-- [ ] 16 Hard-link in place of copy with `-l`
-- [ ] 17 Symlink in place of copy with `-s`
-- [ ] 18 Sparse-file copy with `--sparse=always`
-- [ ] 19 `cp -a` + `restorecon` for service deploys
-- [ ] 20 Exam scenario: deploy into `/var/www/html` and verify with `curl`
+- [ ] 01 Set up `/tmp/cp-lab` and compare `cp` vs `cp -p` metadata
+- [ ] 02 Recursively copy a directory with `cp -r` and inspect lost metadata
+- [ ] 03 Recopy with `cp -a` and verify mode/owner/group/timestamps/context all match
+- [ ] 04 Practice `-i`, `-n`, `-u`, `-v` safety flags
+- [ ] 05 Work the trailing-slash and `src/.` rules until layout is predictable
+- [ ] 06 Execute the RHCSA capstone — `cp -a /etc/ssh /root/ssh-backup` and verify metadata
 
 ---
 
@@ -1007,40 +596,35 @@ Sparse VM image / large zero-runs?            → cp --sparse=always
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Plain `cp` into `/var/www/html` | Apache returns 403 | Use `cp -a` then `restorecon -Rv /var/www/html` |
-| `cp -r src dst` when you wanted contents | `dst/src/...` instead of `dst/...` | Use `cp -r src/. dst/` |
-| Using `*` glob — misses dotfiles | `.htaccess`, `.env` lost | Use `src/.` or `cp -a` |
-| Forgetting `-a` for `/etc/<service>/` | Service starts but behaves oddly | Replace `cp -r` with `cp -a` and re-test |
-| Following a symlink unintentionally | Copy is regular file, not link | Add `-d` (or `-a`) |
-| Overwriting a config without backup | Cannot revert | `cp --backup=numbered` before edit |
-| `cp -Z` when you wanted source context | Wrong context | Use `cp -a` |
-| Cross-FS hard link attempt | `cannot create hard link` | Use `cp -a` or `ln -s` |
+| `cp -r` for backups | Lost metadata | Use `cp -a` |
+| Forgot `-r` on a dir copy | `omitting directory` error | Add `-r` (or `-a`) |
+| `cp -r src dst` when dst exists | Got `dst/src/...` instead of `dst/...` | Use `cp -r src/. dst/` |
+| Plain `cp` of a config under `/etc` | Owner becomes calling user | `cp -a` (and run as root) |
+| Symlinks copied as files | Loss of link semantics | `-a` preserves symlinks (`-d`) |
+| Hard links became two independent files | Disk doubled | `cp -a` preserves hard links |
+| SELinux context lost | Daemon cannot read copy | `cp -a` or `cp --preserve=context` |
+| Used `cp -i` in a script | Interactive prompt hangs the script | Use explicit `-n` or `-f` instead |
+| Used `cp -u` across machines | Clock skew confuses mtime comparisons | Use `rsync -a --checksum` |
+| Used `cp src /target` repeatedly in a loop | Verbose silent overwrites | Add `-v` |
 
 ---
 
-## 📌 Exam Strategy
+## 🎯 Career & Interview Strategy
 
-**RHCSA EX200**
-- Default to `cp -a` for any "copy into service directory" task.
-- Always `ls -lZ` on both source and destination after copying.
-- After deploying content under SELinux-aware paths, **always** chase with `restorecon -Rv`.
+**RHCSA candidate**
+- Train the reflex: when the task says "backup," "preserve permissions," or "with original ownership," type `cp -a`. Verify with `ls -lZ` on both sides.
 
-**RHCE EX294 (Ansible)**
-- `ansible.builtin.copy` parameters map to `cp` semantics:
-  - `mode:`, `owner:`, `group:` ↔ `cp -a`
-  - `setype:`, `seuser:`, `serole:` ↔ context preservation/override
-  - `backup: yes` ↔ `cp --backup`
+**RHCE candidate**
+- Ansible: `copy:` with `mode:`, `owner:`, `group:`, and `setype:` reproduces `cp -a` semantics declaratively.
 
-**CKA**
-- Common copy operations:
-  - `cp -a /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/backup/`
-  - `cp -a /etc/cni/net.d /tmp/cni-backup`
-  - `cp ~/.kube/config ~/.kube/config.bak` before editing context
+**SRE / Platform interview**
+- "Always back up before you change." → `sudo cp -a /etc/CONFIG_FILE /root/CONFIG_FILE.bak-$(date +%F-%H%M)` before any edit. Rollback is a one-line `cp -a` in reverse.
 
-**RHCA**
-- RH342: pre-change snapshot `cp -a /etc/conf-file{,.$(date +%s).bak}`
-- RH358: deploy service configs with `cp -a` + `restorecon`
-- RH318 (Virt): `cp --sparse=always` for VM images
+**DevOps**
+- Dockerfile `COPY` preserves mode only by default; use `--chown=user:group` and `--chmod` (BuildKit) for parity with `cp -a`.
+
+**AI / MLOps**
+- `cp -a` on a 1 TB dataset is faster than `rsync -a` locally; cross-host, `rsync -aP --partial` resumes.
 
 ---
 
@@ -1048,16 +632,15 @@ Sparse VM image / large zero-runs?            → cp --sparse=always
 
 | Lab | Connection |
 |---|---|
-| Lab 06 — SELinux contexts | Why `cp -a` vs `cp -Z` matters |
-| Lab 09 — Hard/soft links | `cp -a` preserves; `cp` (plain) dereferences |
-| Lab 10 — `mv` | Cross-FS `mv` = `cp -a` + `rm`; same metadata rules apply |
-| Lab 11 — `rm -rf` | Pair with `cp --backup` for safe edits |
-| Task 16 — Apache document root | Direct application of `cp -a` + `restorecon` |
-| Task 11 — `tar` archive | `cp -a` to stage files before archiving |
+| Lab 05 — Directory Navigation | You must know the paths before you copy them |
+| Lab 06 — Listing & SELinux Contexts | The verification side of `cp -a` |
+| Lab 09 — Hard and Soft Links | Behavior of `cp -d` / `cp -a` with links |
+| Lab 10 — Moving and Renaming Files | The sibling of `cp`: same inode, new name |
+| Lab 11 — Safe Deletion | The undo for accidental copies |
 
 ---
 
 ## 👤 Author
 
-**Kelvin R. Tobias**  
+**Kelvin R. Tobias**
 [kelvinintech.com](https://kelvinintech.com) · [GitHub](https://github.com/kelvintechnical) · [LinkedIn](https://www.linkedin.com/in/kelvin-r-tobias-211949219)
