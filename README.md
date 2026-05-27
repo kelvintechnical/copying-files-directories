@@ -1,646 +1,982 @@
-# Lab: Copying Files and Directories — `cp`, `cp -R`, `cp -a`
+# Lab 08: Copying Files and Directories — `cp`, `cp -R`, `cp -a`, `cp --preserve`
 
-**Series:** linux-ops-mastery — RHCSA Essential Tools & File Operations
-**Subjects covered:** `cp` for single-file copy, `-R`/`-r` for recursive directory copy, `-a` "archive" mode (preserves owner, group, mode, timestamps, symlinks, SELinux context), `-i` interactive overwrite prompts, `-n` no-clobber, `-u` update-only-if-newer, `-v` verbose, `-p` preserve mode/owner/timestamps, `--preserve=context` for SELinux, the difference between `cp -R src dst/` and `cp -R src/. dst/`, the trailing-slash gotcha, and the production reflex of "use `-a` unless you have a reason not to"
-**Career arcs covered:** RHCSA (every "copy this config to that location" task), RHCE (Ansible `copy:` module — same semantics), SRE (backup snapshots before changes), DevOps (Dockerfile `COPY` inherits from cp semantics), AI/MLOps (dataset / checkpoint replication across nodes)
-**Prerequisite:** Labs 05–07 (navigation, listing, timestamps)
-**Time Estimate:** 30 to 45 minutes
-**Difficulty arc:** Task 1 foundation (single-file copy) · 2 recursive copy · 3 the `-a` preserve-everything pattern · 4 interactive/no-clobber/update flags · 5 the trailing-slash and `src/.` tricks · 6 RHCSA exam-realistic capstone
+- **Series:** linux-ops-mastery — File Operations & Shell Fundamentals
+- **Career arcs covered:** RHCSA EX200 (backup/restore, `/etc/skel`, config staging), RHCE EX294 (`ansible.builtin.copy` with `mode:` `owner:` `preserve:`), CKA (`kubectl cp`, ConfigMap staging), RHCA — RH358 (preserving SELinux + ACLs on copies)
+- **Prerequisite:** Lab 00 (Ansible control node) + Lab 07 (timestamps, `stat`)
+- **Time Estimate:** 35–50 minutes
+- **Tasks:** 5 (ADHD 3-1-1 spec — 3 RHCSA + 1 Ansible + 1 Verification capstone)
+- **Practice Directory (lab-wide rotation #08):** `/etc/skel`
+- **Sandbox:** `/srv/cp-lab` (writable, separate from `/etc/skel` so we never touch real user defaults)
+- **Traps rehearsed this lab:** **T08-A** (`cp` resets mtime and SELinux context on the destination unless you use `-a` or `--preserve`) · **T08-B** (`cp -R` does NOT preserve symlinks as symlinks by default — they get followed; `cp -a` does preserve them) · **T08-C** (Ansible's `ansible.builtin.copy` `src:` is RESOLVED ON THE CONTROL NODE — for in-place copies you need `remote_src: true`)
 
----
-
-## Objective
-
-Copy files and directories without losing metadata, without overwriting things you did not mean to, and without falling into the "did I copy the directory or only its contents?" trap. By the end of this lab you can perform any RHCSA-style copy task in two seconds — and you understand exactly why `-a` is the senior-engineer default.
-
-The capstone is an exam-realistic prompt: *"Make a complete backup of `/etc/ssh/` to `/root/ssh-backup/` such that every file's owner, group, mode, timestamps, and SELinux context are preserved exactly. Verify by comparing one host key's metadata between source and destination."*
-
-> **Lab safety note:** Every command in this lab reads from `/etc/ssh` and your sandbox under `/tmp/cp-lab`, and writes only into `/tmp/cp-lab` or `/root/...`. No system file is modified.
+> **This lab's practice directory is: `/etc/skel`** — every task references it for inspiration (it's where new-user defaults live). We **read** `/etc/skel` only; we **write** only inside `/srv/cp-lab`.
 
 ---
 
-## Concept: A Copy Is a Choice About Metadata
+## 🖥️ LAB HEADER BLOCK — run this FIRST
 
-The bytes of a file are easy to copy. The **metadata** is where copies get interesting:
-
-| Metadata | Default `cp` preserves? | `cp -p` preserves? | `cp -a` preserves? |
-|---|---|---|---|
-| File contents | yes | yes | yes |
-| Mode (permissions) | no (uses umask) | yes | yes |
-| Owner / group | no (current user) | yes (if root) | yes (if root) |
-| mtime | no (now) | yes | yes |
-| atime | no (now) | yes | yes |
-| ctime | no (now — kernel always sets) | no | no |
-| Symlinks | followed (target copied) | followed | preserved as symlinks |
-| Hard links | broken (two independent copies) | broken | preserved |
-| SELinux context | no (inherits destination) | no | yes |
-| ACLs | no | no | yes |
-| Extended attributes | no | no | yes |
-
-```
-   ┌──────────────────────────────────────────────────────┐
-   │                cp source dest                        │
-   ├──────────────────────────────────────────────────────┤
-   │  default   → bytes only; new inode; new metadata     │
-   │  cp -p     → bytes + mode/owner/group/times          │
-   │  cp -R/-r  → recurse into directories                │
-   │  cp -a     → -dR --preserve=all   (the everything)   │
-   └──────────────────────────────────────────────────────┘
+```bash
+echo "🖥️  ENV:   ${ENV:-DECLARE_ME}"
+echo "💿  DISK:  $(lsblk 2>/dev/null | awk '$NF=="disk"{print "/dev/"$1}' | paste -sd, -)"
+echo "🔐  SE:    $(getenforce 2>/dev/null || echo n/a)"
+echo "📦  OS:    $(cat /etc/redhat-release 2>/dev/null || grep PRETTY_NAME /etc/os-release)"
+echo "🕒  TIME:  $(date -Is)"
+echo "👤  USER:  $(whoami)@$(hostname)"
+echo "⚠️  TRAP REMINDERS THIS LAB: T08-A T08-B T08-C"
+echo "📁  PRACTICE DIR: /etc/skel"
+echo ""
+echo "💡 /etc/skel contents (read-only):"
+ls -laZ /etc/skel
 ```
 
-> **Why this matters:** On the RHCSA exam, the prompt almost always says "preserve" or "with original permissions" or "as a backup." Each of those words is a hint to reach for `-a` instead of `-r`. Using the wrong flag silently loses metadata, and the grader checks the result.
+> **STOP — paste header output before running setup.**
 
 ---
 
-## 📜 Why `cp -a` Exists — The Story
+## 🎯 Objective
 
-In **Unix v1 (1971)** `cp` did one job: copy bytes. Metadata? Use `chmod`, `chown`, `touch` separately. As Unix matured into a multi-user system, "make a backup of `/etc`" became a nightly chore — and the manual sequence "copy then chmod then chown then touch" became an error-prone ritual.
+Copy single files, copy directory trees, and **preserve everything that matters** — timestamps, owner, group, SELinux context, ACLs, and symlinks. By the end you will:
 
-The Berkeley team responded with `-p` (preserve), shipped in **4.3 BSD (1986)**, which preserved owner/group/mode/timestamps in one operation. GNU coreutils later added `-d` (preserve symlinks), `--preserve=context` (SELinux), and finally `-a` (archive — equivalent to `-dR --preserve=all`) to combine every "do the right thing for a backup" flag into one letter.
-
-So `cp -a` is the result of 35 years of "I forgot to preserve X." It is the convergent answer to "what do I want when I copy a directory tree for safekeeping?" The answer is **everything**.
-
-> **The point of the story:** Default `cp` is the "give me a clean copy with the current user's defaults" tool. `cp -a` is the "treat this as a backup" tool. Pick the right one for the job.
+- Choose between `cp`, `cp -R`, `cp -a`, and `cp --preserve=...` like a senior admin
+- Know exactly what `cp -a` preserves (mode, ownership, timestamps, links, contexts, xattrs)
+- Replicate the same operations with `ansible.builtin.copy` declaratively
+- Verify with `diff -r`, `getfacl`, `ls -lZ` that the copy is byte-identical AND metadata-identical
 
 ---
 
-## 👪 The cp Family — Who Lives There
+## 🛠️ Setup — run once before Task 1
 
-### Common flags
+```bash
+sudo mkdir -p /srv/cp-lab/src /srv/cp-lab/dst
+sudo mkdir -p /root/rhcsa_journal/lab08
 
-| Flag | Meaning |
+# Build a sample source tree with mixed file types
+echo "hello"          | sudo tee /srv/cp-lab/src/file.txt
+echo "secret"         | sudo tee /srv/cp-lab/src/secret.txt
+sudo chmod 600 /srv/cp-lab/src/secret.txt
+sudo mkdir -p /srv/cp-lab/src/sub
+echo "deep"           | sudo tee /srv/cp-lab/src/sub/deep.txt
+sudo ln -sfn /srv/cp-lab/src/file.txt /srv/cp-lab/src/link-to-file
+sudo touch -t 202001151200 /srv/cp-lab/src/file.txt
+ls -laR /srv/cp-lab/src/
+```
+
+---
+
+## Task 1 — `cp` a Single File, Watch What Changes
+
+**Practice directory this task:** `/etc/skel` (read), `/srv/cp-lab` (write)
+
+### 🔁 Warm-Up — Commands from Previous Labs
+
+```bash
+sudo mkdir -p /root/rhcsa_journal/lab08/task1
+date -Is | sudo tee /root/rhcsa_journal/lab08/task1/start.txt
+ls -laZ /etc/skel | sudo tee -a /root/rhcsa_journal/lab08/task1/start.txt
+echo "exit was: $?"
+```
+
+### Purpose
+
+`cp src dst` is the base case. Compare timestamps, mode, and SELinux context BEFORE and AFTER to see what `cp` resets to default versus copies from the source.
+
+### Main Command Block
+
+```bash
+# Source state — note mtime is Jan 15, 2020
+ls -lZ /srv/cp-lab/src/file.txt
+stat -c 'mode=%a mtime=%y owner=%U:%G' /srv/cp-lab/src/file.txt
+
+# Plain cp — destination gets NEW mtime (now), inherits parent's SELinux context
+sudo cp /srv/cp-lab/src/file.txt /srv/cp-lab/dst/file.txt
+ls -lZ /srv/cp-lab/dst/file.txt
+stat -c 'mode=%a mtime=%y owner=%U:%G' /srv/cp-lab/dst/file.txt
+
+# cp -i — interactive (prompts before overwrite)
+sudo cp -i /srv/cp-lab/src/file.txt /srv/cp-lab/dst/file.txt   # answer y when prompted
+
+# cp -v — verbose
+sudo cp -v /srv/cp-lab/src/file.txt /srv/cp-lab/dst/file2.txt
+
+# cp -n — no-clobber (don't overwrite existing files)
+sudo cp -n /srv/cp-lab/src/file.txt /srv/cp-lab/dst/file2.txt   # silent skip
+
+# Capture
+{
+  echo "=== source ===";    ls -lZ /srv/cp-lab/src/file.txt
+  echo "=== plain cp ==="; sudo cp /srv/cp-lab/src/file.txt /srv/cp-lab/dst/file.txt; ls -lZ /srv/cp-lab/dst/file.txt
+  echo "=== mtime drift ==="; stat -c 'src=%y' /srv/cp-lab/src/file.txt; stat -c 'dst=%y' /srv/cp-lab/dst/file.txt
+} 2>&1 | sudo tee /root/rhcsa_journal/lab08/task1/transcript.txt
+```
+
+### Human-Readable Breakdown
+
+Plain `cp src dst` does the following:
+
+| Attribute | What happens |
 |---|---|
-| `-r` / `-R` | Recursive (required for directories) |
-| `-i` | Interactive — prompt before overwrite |
-| `-n` | No-clobber — skip if destination exists |
-| `-f` | Force overwrite (default) |
-| `-u` | Update only — copy only if source is newer or destination missing |
-| `-v` | Verbose — print each copy |
-| `-p` | Preserve mode, owner, group, timestamps |
-| `--preserve=mode,owner,group,timestamps,links,context,xattr,all` | Granular preserve |
-| `-a` | Archive — `-dR --preserve=all` (the everything) |
-| `-l` | Hard-link instead of copy (when possible) |
-| `-s` | Make symlink instead of copy |
-| `-L` | Follow symlinks in source |
-| `-P` | Never follow symlinks (preserve as symlinks) |
-| `-d` | `-P --preserve=links` (preserve symlinks and hardlinks) |
-| `-t TARGET` | Specify destination first (so source args can be repeated/scripted) |
-| `-T` | Treat destination as a file, not a directory |
+| Data bytes | Copied exactly |
+| Mode | Inherits source's mode, then masked by `umask` for *new* files (RHEL default: 022 → 0644) |
+| Owner | Set to **calling user**, NOT source's owner |
+| Group | Set to **calling user's primary group** |
+| mtime | Set to **now** |
+| atime | Set to **now** |
+| SELinux context | Set to **parent directory's default context** |
+| ACLs | Lost |
+| xattrs | Lost |
+| Symlinks | **Followed** (you get the file pointed to, not the link) |
 
-### Related commands
+This is the source of `T08-A` — `cp` is destructive to metadata by default. The mtime jumps to now, the SELinux context resets, the owner becomes you. That's almost never what you want when staging a real config file.
 
-| Command | Notes |
-|---|---|
-| `mv` | Rename / move (no metadata to copy, just rename) |
-| `rsync -a` | Same idea as `cp -a` but resumable, networked, with `--delete` |
-| `install -m MODE` | Copy with explicit mode; common in Makefiles |
-| `tar c ... \| tar x ...` | Old-school metadata-preserving copy |
-| `cpio -p` | The original "copy preserving everything" — predates `cp -a` |
+### Reading It Left to Right
 
-> **The point of the family tree:** For RHCSA, `cp` + `-a`/`-r` covers everything. For multi-machine work, `rsync -a`. For "build artifacts," `install`. For one-time archive operations, `tar`.
+`cp SRC DST`
 
----
+- `cp` — copy
+- `SRC` — source path (file)
+- `DST` — destination path (file or directory)
 
-## 🔬 The Anatomy of a Copy — In One Diagram
+If `DST` is an existing directory, `cp` copies `SRC` into it as `DST/$(basename SRC)`. If `DST` is a file path, `cp` overwrites it (with `-i` it prompts first).
+
+`cp -v SRC DST`
+
+- `-v` — verbose; print `'src' -> 'dst'` for each copy
+
+### The Story
+
+A grader's question: "Copy `/etc/skel/.bashrc` to `/root/backup.bashrc`." If you write `cp /etc/skel/.bashrc /root/backup.bashrc`, that's RHCSA-correct for the **data**, but the timestamps and SELinux context of the destination won't match the source. For most exam questions that's fine; for "preserve the original timestamps," you need `-p` (next task).
+
+### Expected Output
 
 ```
-$ cp -a /etc/ssh /root/ssh-backup
-       │       │ │
-       │       │ └─ destination — a directory (will be CREATED if missing, or used as PARENT if exists)
-       │       └─ source — a directory
-       └─ -a flag = -dR --preserve=all
+$ ls -lZ /srv/cp-lab/src/file.txt
+-rw-r--r--. 1 root root unconfined_u:object_r:var_t:s0 6 Jan 15  2020 /srv/cp-lab/src/file.txt
 
-What the shell + cp actually do:
-  1. stat the source to learn its type and metadata.
-  2. If dest does not exist, create it (mkdir).
-  3. For each entry in source:
-       - regular file  → read source bytes, write to dest/name, copy metadata
-       - directory     → recurse
-       - symlink (-d)  → preserve as symlink, do NOT follow
-       - hardlink (-d) → preserve the link count
-  4. Apply final metadata (timestamps last so they are not bumped by writes).
-
-Trailing-slash trap:
-  cp -a src  dst    → if dst exists, places src AS dst/src
-                       (final layout: dst/src/...)
-  cp -a src/ dst    → SAME behavior as above (trailing / on src has no effect in cp)
-  cp -a src/. dst   → copies the CONTENTS of src into dst (no extra level)
-  cp -aT src  dst   → forces "treat dst as a file" — copies CONTENTS, dst becomes "src"
+$ sudo cp /srv/cp-lab/src/file.txt /srv/cp-lab/dst/file.txt
+$ ls -lZ /srv/cp-lab/dst/file.txt
+-rw-r--r--. 1 root root unconfined_u:object_r:var_t:s0 6 May 27 15:01 /srv/cp-lab/dst/file.txt
+                                                                ^^^^^^^^^^
+                                                                mtime jumped to now
 ```
 
-> **Reading rule:** The position of the slash on the **destination** rarely matters; the difference between `src` and `src/.` on the **source** is what controls whether you get `dst/src/...` or `dst/...`.
+### Switches Table
 
----
-
-## 📚 cp Reference Table
-
-| Task | Command | Notes |
+| Switch | Meaning | Why it matters |
 |---|---|---|
-| Single-file copy | `cp /etc/hosts /tmp/hosts.bak` | Loses mode/owner/timestamps |
-| Single-file with preservation | `cp -p /etc/hosts /tmp/hosts.bak` | Preserves mode/owner/times |
-| Directory copy | `cp -r /etc/ssh /tmp/ssh.bak` | Recursive |
-| Archive copy (recommended) | `cp -a /etc/ssh /tmp/ssh.bak` | Preserves everything |
-| Copy contents (not the dir itself) | `cp -a /etc/ssh/. /tmp/ssh-contents/` | Use `/.` on source |
-| Verbose | `cp -av /etc/ssh /tmp/ssh.bak` | Prints each copy |
-| Interactive (prompt before clobber) | `cp -i a b` | Y/N per overwrite |
-| No-clobber | `cp -n a b` | Skip if dest exists |
-| Update-only-if-newer | `cp -u src dst` | Diff by mtime |
-| Force overwrite | `cp -f a b` | Default; rarely needed |
-| Multiple sources, one target dir | `cp f1 f2 f3 /target/` | Target must be a dir (or use `-t`) |
-| Specify target first (-t form) | `cp -t /target/ f1 f2 f3` | Script-friendly |
-| Make a hard link instead | `cp -l a b` | Same inode |
-| Make a symlink instead | `cp -s a b` | Soft link |
-| Preserve SELinux only | `cp --preserve=context a b` | Without `-a` |
-| Preserve owner only | `cp --preserve=owner a b` | Needs root for owner change |
+| `cp SRC DST` | Base copy | Data only — metadata reset to defaults |
+| `-i` | Interactive (prompt before overwrite) | Safer for ad-hoc shell work |
+| `-n` | No-clobber (skip existing) | Idempotent without prompting |
+| `-v` | Verbose | Script debugging |
+| `-f` | Force (overwrite without prompt) | Pair with `-i` careful |
+| `-u` | Update only (skip if dst is newer) | Backup tools |
+| `-b` | Backup existing dst | Safety net |
 
-> **Rule one of cp:** When in doubt, `cp -a` and verify. The flag costs nothing extra; missing metadata costs you the grade or the incident.
+### 🧠 Concept Card
 
----
-
-## 🎯 Career Pathway Sidebar
-
-| Level | Why this lab matters |
+| Concept | One-Line |
 |---|---|
-| **RHCSA candidate** | "Copy `/etc/foo` to `/tmp/foo-backup` preserving permissions and contexts" is the canonical exam phrasing. `cp -a` solves it. |
-| **RHCE candidate** | Ansible's `copy:` module mirrors `cp -a` semantics through `mode:`, `owner:`, `group:`, and SELinux relabeling. |
-| **SRE / Platform** | Before any risky config change: `cp -a /etc/sshd_config /root/sshd_config.bak-$(date +%s)`. Roll back with `cp -a` back. |
-| **DevOps** | Dockerfile `COPY src dst` is the build-time analogue. Inside images, `cp -a` is used for layered initialization. |
-| **AI / MLOps** | Dataset replication across NFS or local disks: `cp -a /shared/datasets/v1 /local/scratch/datasets/v1` keeps timestamps so cache-validation scripts work. |
-
----
-
-## 🔧 The 6 Tasks
-
-> Six exam-realistic phases that build the **copy → preserve → verify** habit.
-
----
-
-### Task 1 — Single-file copy with and without `-p`
-
-**Purpose:** Build the sandbox, copy a file with default `cp`, then re-copy with `-p`, and prove the difference in metadata.
-
-```bash
-mkdir -p /tmp/cp-lab && cd /tmp/cp-lab
-
-cp /etc/hosts hosts-plain.copy
-ls -l /etc/hosts hosts-plain.copy
-stat -c 'm=%y u=%U g=%G mode=%a' /etc/hosts hosts-plain.copy
-
-cp -p /etc/hosts hosts-preserved.copy
-ls -l /etc/hosts hosts-preserved.copy
-stat -c 'm=%y u=%U g=%G mode=%a' /etc/hosts hosts-preserved.copy
-```
-
-**Human-Readable Breakdown:** Make the sandbox, copy `/etc/hosts` two ways — plain (no metadata preservation) and `-p` (preserve mode/owner/group/timestamps). Compare the metadata side-by-side.
-
-**Reading it left to right:** Plain `cp` performs a `read()` from the source and `write()` to a freshly created destination — the kernel assigns mtime/atime to **now** and owner/group to the **calling user**. `cp -p` issues a final `chmod`/`chown`/`utimes` to align metadata with the source.
-
-**The story:** This is the experiment that converts you from "cp copies files" to "cp copies bytes; metadata is a choice." Once you have run it, you reach for `-p` (or `-a`) automatically.
-
-**Expected output:**
-
-```text
--rw-r--r--. 1 root     root     158 May 21 14:33 /etc/hosts
--rw-r--r--. 1 ec2-user ec2-user 158 May 26 13:40 hosts-plain.copy
-m=2026-05-21 14:33:18 u=root g=root mode=644
-m=2026-05-26 13:40:00 u=ec2-user g=ec2-user mode=644
--rw-r--r--. 1 root     root     158 May 21 14:33 /etc/hosts
--rw-r--r--. 1 ec2-user ec2-user 158 May 21 14:33 hosts-preserved.copy
-m=2026-05-21 14:33:18 u=root g=root mode=644
-m=2026-05-21 14:33:18 u=ec2-user g=ec2-user mode=644
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `cp SRC DST` | Plain copy |
-| `cp -p SRC DST` | Preserve mode/owner/group/timestamps |
-| `stat -c 'FMT'` | Custom stat output |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Owner did not transfer | You are not root — `-p` can only set owner if you have CAP_CHOWN |
-| mtime is "now" with `-p` | Filesystem may not support setting mtime — rare |
-| Mode differs by `0644` vs `664` | Source file mode was `664` — `-p` preserves it |
-
----
-
-### Task 2 — Recursive directory copy with `-r`
-
-**Purpose:** Use `-r` (or `-R`) to copy a directory tree. Notice that plain `-r` does **not** preserve owner/timestamps/contexts.
-
-```bash
-cd /tmp/cp-lab
-
-cp -r /etc/ssh ssh-r.copy
-ls -ld ssh-r.copy
-ls -l ssh-r.copy | head -n 5
-stat -c 'mode=%a u=%U g=%G m=%y' ssh-r.copy ssh-r.copy/sshd_config
-```
-
-**Human-Readable Breakdown:** Recursively copy `/etc/ssh` into the sandbox with `-r`. List the copied directory and one file inside it, then compare metadata against the source.
-
-**Reading it left to right:** `cp -r SRC DST` recurses into SRC's directories. For each file, the default (no preservation) applies — owner becomes you, timestamps become now, mode obeys your umask combined with source mode.
-
-**The story:** Most beginners learn `cp -r` and think they have done a backup. They have copied bytes, not state. The metadata loss only shows up later — when SSH refuses to use the host key because permissions are too open, or when `find -mtime` returns no results because everything has the same recent mtime.
-
-**Expected output:**
-
-```text
-drwxr-xr-x. 4 ec2-user ec2-user 175 May 26 13:42 ssh-r.copy
--rw-r--r--. 1 ec2-user ec2-user 4434 May 26 13:42 sshd_config
--rw-r--r--. 1 ec2-user ec2-user 1872 May 26 13:42 ssh_config
-...
-mode=755 u=ec2-user g=ec2-user m=2026-05-26 13:42:00
-mode=644 u=ec2-user g=ec2-user m=2026-05-26 13:42:00
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `cp -r SRC DST` | Recursive copy |
-| `cp -R SRC DST` | Same as `-r` (POSIX form) |
-| `ls -ld DIR` | Long-list the directory itself |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `cp: -r not specified; omitting directory '/etc/ssh'` | Add `-r` |
-| Permission denied reading host key files | Run as root (`sudo cp -r ...`) — keys are mode 0600 root-only |
-| Owner is wrong | Use `-p` or `-a` (and run as root) |
-
----
-
-### Task 3 — Archive copy with `-a` (the everything)
-
-**Purpose:** Use `-a` to preserve mode, owner, group, timestamps, symlinks, hard links, ACLs, and SELinux context all at once.
-
-```bash
-sudo -i
-cd /tmp/cp-lab
-
-cp -a /etc/ssh ssh-a.copy
-ls -ldZ ssh-a.copy
-ls -lZ  ssh-a.copy/sshd_config /etc/ssh/sshd_config
-stat -c 'mode=%a u=%U g=%G C=%C m=%y' ssh-a.copy/sshd_config /etc/ssh/sshd_config
-```
-
-**Human-Readable Breakdown:** Become root. Use `cp -a` to copy `/etc/ssh` with everything preserved. Compare the destination's `sshd_config` against the source — mode, owner, group, SELinux context, and mtime should all match.
-
-**Reading it left to right:** `cp -a` is `-dR --preserve=all`: `-d` preserves symlinks and hardlinks, `-R` recurses, `--preserve=all` keeps mode/owner/group/timestamps/links/context/xattrs. The result is byte-and-metadata identical to the source.
-
-**The story:** Once you have used `-a` and verified the output, you stop typing `-r` for backups. The cost is zero. The benefit is "passes the exam grader, doesn't surprise the daemon."
-
-**Expected output:**
-
-```text
-drwxr-xr-x. 4 root root system_u:object_r:etc_t:s0 175 May 21 14:33 ssh-a.copy
--rw-------. 1 root root system_u:object_r:etc_t:s0 4434 May 21 14:33 ssh-a.copy/sshd_config
--rw-------. 1 root root system_u:object_r:etc_t:s0 4434 May 21 14:33 /etc/ssh/sshd_config
-mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
-mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `cp -a SRC DST` | Archive copy |
-| `--preserve=all` | Same as `-a`'s preservation set |
-| `--preserve=context` | Just SELinux context |
-| `ls -lZ` / `ls -ldZ` | Include SELinux context column |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Owner did not transfer | Need root (`sudo -i`) |
-| Context shows `default_t` | Filesystem may not support xattrs, or `--preserve=context` failed — verify with `ls -Z` |
-| Symlinks were followed and copied as files | Use `-a` (preserves symlinks), not `-r` |
-
----
-
-### Task 4 — Safety flags: `-i`, `-n`, `-u`, `-v`
-
-**Purpose:** Practice the four flags that protect you from accidental overwrites and noisy output: `-i` (interactive), `-n` (no-clobber), `-u` (update), `-v` (verbose).
-
-```bash
-cd /tmp/cp-lab
-
-mkdir -p safety && cd safety
-echo "original" > target.txt
-
-# Interactive — prompts before overwrite
-echo "new" > src.txt
-cp -i src.txt target.txt
-# (answer 'n' to keep original, 'y' to overwrite)
-
-# No-clobber — skips silently
-cp -n src.txt target.txt
-cat target.txt
-
-# Update — only overwrites if source is newer
-touch -d "1 hour ago" old-src.txt
-cp -u old-src.txt target.txt
-cat target.txt
-sleep 1
-touch new-src.txt
-cp -u new-src.txt target.txt
-cat target.txt
-
-# Verbose
-cp -v src.txt verbose-result.txt
-```
-
-**Human-Readable Breakdown:** Create a `target.txt`, then try to overwrite it under four different safety regimes. `-i` asks. `-n` silently skips. `-u` overwrites only if the source is newer. `-v` prints each copy operation.
-
-**Reading it left to right:** `-i` causes `cp` to read from stdin before overwriting. `-n` is "no" — the destination already exists, do nothing. `-u` compares mtimes and acts only when the source is strictly newer. `-v` prints `'src' -> 'dst'` for each operation.
-
-**The story:** These are the seatbelts. In production scripts that loop over many files, `-n` prevents disasters when sources and destinations overlap; `-u` provides cheap idempotence; `-v` aids debugging. In interactive use, `-i` is a paranoid safety net that nobody regrets.
-
-**Expected output:**
-
-```text
-cp: overwrite 'target.txt'? n
-original
-original
-                              ← (no change — source older with -u)
-                              ← (new file created)
-'src.txt' -> 'verbose-result.txt'
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `-i` | Interactive overwrite prompt |
-| `-n` | No-clobber |
-| `-u` | Update only if source newer |
-| `-v` | Verbose |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `-i` did not prompt | Output is not a TTY (e.g. in a script) — `-i` is suppressed |
-| `-n` silently skipped what you wanted to overwrite | Wrong default — use `-f` or remove `-n` |
-| `-u` did not overwrite a newer source | Verify mtimes with `stat`; clock skew between machines breaks `-u` |
-
----
-
-### Task 5 — The trailing slash and `src/.` content-copy trick
-
-**Purpose:** Master the most common confusion in `cp -r`: "do I want the directory itself at the destination, or its contents?"
-
-```bash
-cd /tmp/cp-lab
-rm -rf foo bar baz qux
-
-mkdir foo
-echo "A" > foo/a.txt
-echo "B" > foo/b.txt
-
-# Case 1 — destination dir exists; cp places SOURCE INSIDE it
-mkdir bar
-cp -a foo bar
-ls -R bar      # -> bar/foo/a.txt
-
-# Case 2 — destination dir does NOT exist; cp makes it WITH source's contents
-cp -a foo baz
-ls -R baz      # -> baz/a.txt   (no extra `foo` level)
-
-# Case 3 — copy CONTENTS of source into existing destination
-mkdir qux
-cp -a foo/. qux
-ls -R qux      # -> qux/a.txt   (contents only — what you usually want)
-
-# Case 4 — force "treat dest as a file" with -T
-mkdir -p one
-echo "X" > one/x.txt
-cp -aT one two
-ls -R two      # -> two/x.txt (same as case 2)
-```
-
-**Human-Readable Breakdown:** Build a small source tree, then copy it four ways to see what destination layout each one produces. The crucial distinction: when the destination exists, plain `cp -a foo bar` places `foo` inside `bar`; `cp -a foo/. bar` copies only the contents.
-
-**Reading it left to right:** Case 1 — dest exists → cp creates `bar/foo`. Case 2 — dest missing → cp creates `baz` as the new "foo." Case 3 — `foo/.` means "everything inside foo" → qux receives the contents, not the foo level. Case 4 — `-T` forces "destination is the renamed source," even if it already exists.
-
-**The story:** Every `cp -r` bug in production scripts is this gotcha. Watch the layout once with your own hands and you stop guessing.
-
-**Expected output:**
-
-```text
-bar:
-foo
-
-bar/foo:
-a.txt  b.txt
-
-baz:
-a.txt  b.txt
-
-qux:
-a.txt  b.txt
-
-two:
-x.txt
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `cp -a SRC DST` | Standard copy |
-| `cp -a SRC/. DST` | Copy contents only (DST must exist) |
-| `cp -aT SRC DST` | Treat DST as a file/dir to be created with SRC's contents |
-| `rm -rf` | Remove old test data (Lab 11 deep dive) |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Got `bar/foo/...` when expecting `bar/...` | Use `cp -a foo/. bar` |
-| Got `bar/...` when expecting `bar/foo/...` | The dest did not exist; pre-create with `mkdir` |
-| `-T` complains "Not a directory" | Destination exists as a file; remove it first |
-
----
-
-### Task 6 — Capstone: RHCSA-realistic full-metadata backup
-
-**Task statement:** *"Make a complete backup of `/etc/ssh/` to `/root/ssh-backup/` such that every file's owner, group, mode, timestamps, and SELinux context are preserved exactly. Verify by comparing `sshd_config` metadata between source and destination."*
-
-**Purpose:** Execute a real exam-style preserved backup end-to-end, then verify metadata.
-
-```bash
-sudo -i
-
-cp -a /etc/ssh /root/ssh-backup
-
-ls -ldZ /etc/ssh /root/ssh-backup
-diff -q /etc/ssh/sshd_config /root/ssh-backup/sshd_config
-
-echo "--- source ---"
-stat -c 'mode=%a u=%U g=%G C=%C m=%y' /etc/ssh/sshd_config
-echo "--- backup ---"
-stat -c 'mode=%a u=%U g=%G C=%C m=%y' /root/ssh-backup/sshd_config
-
-test -d /root/ssh-backup && echo "VERIFY: backup directory exists"
-test "$(stat -c '%C' /etc/ssh/sshd_config)" = "$(stat -c '%C' /root/ssh-backup/sshd_config)" \
-  && echo "VERIFY: SELinux contexts match"
-test "$(stat -c '%a' /etc/ssh/sshd_config)" = "$(stat -c '%a' /root/ssh-backup/sshd_config)" \
-  && echo "VERIFY: modes match"
-```
-
-**Human-Readable Breakdown:** Become root, run `cp -a` to clone `/etc/ssh` to `/root/ssh-backup`. Verify with `ls -ldZ`, `diff -q` (no differences), and a side-by-side `stat` of `sshd_config`. The final `test` lines compare specific fields to fail loudly if anything drifted.
-
-**Layer stack you built:**
-
-```text
-/etc/ssh                  ─── original config dir
-   │
-   ▼  cp -a
-/root/ssh-backup          ─── preserved copy
-   ├── identical contents (diff -q empty)
-   ├── identical owner/group (root:root)
-   ├── identical mode (per file)
-   ├── identical mtime (per file)
-   ├── identical SELinux context (etc_t / sshd_key_t)
-   └── symlinks preserved as symlinks (if any)
-```
-
-**The story:** This is the **canonical 60-second exam answer** for any "preserved backup" task. Memorize the spine: `cp -a /src /dst` → `diff -q` for content → `stat -c '%a %U %G %C'` for metadata. The grader script does the same comparison.
-
-**Expected verification output:**
-
-```text
-drwxr-xr-x. 4 root root system_u:object_r:etc_t:s0 175 May 21 14:33 /etc/ssh
-drwxr-xr-x. 4 root root system_u:object_r:etc_t:s0 175 May 21 14:33 /root/ssh-backup
---- source ---
-mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
---- backup ---
-mode=600 u=root g=root C=system_u:object_r:etc_t:s0 m=2026-05-21 14:33:18
-VERIFY: backup directory exists
-VERIFY: SELinux contexts match
-VERIFY: modes match
-```
-
-**Cleanup**
-
-```bash
-rm -rf /tmp/cp-lab /root/ssh-backup
-exit
-```
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Owner is wrong | Need root (`sudo -i`) before running `cp -a` |
-| Mode differs | Used `-r` instead of `-a` — re-run with `-a` |
-| `diff -q` reports differences | Bytes do not match — re-run; verify no edits between |
-| SELinux context wrong | xattrs not preserved on target FS — confirm `xattr` mount option |
-
----
-
-## 🔍 cp Decision Guide
-
-```
-Got files to copy?
-  │
-  ├── "Single file, just the bytes"
-  │       └── ✅ cp src dst
-  │
-  ├── "Single file, preserve metadata"
-  │       └── ✅ cp -p src dst
-  │
-  ├── "Whole directory, just contents"
-  │       └── ✅ cp -r src dst             (loses metadata)
-  │
-  ├── "Whole directory, preserve EVERYTHING (recommended)"
-  │       └── ✅ cp -a src dst
-  │
-  ├── "Copy the CONTENTS of a dir (no extra parent level)"
-  │       └── ✅ cp -a src/. dst/
-  │
-  ├── "Be paranoid about overwrites"
-  │       └── ✅ cp -i src dst             (prompt)
-  │       └── ✅ cp -n src dst             (skip)
-  │       └── ✅ cp -u src dst             (only if newer)
-  │
-  ├── "Bandwidth- or atomicity-sensitive across machines"
-  │       └── ✅ rsync -a src/ host:/dst/
-  │
-  └── "Build artifacts with explicit mode"
-          └── ✅ install -m 0755 src /usr/local/bin/dst
-```
-
----
-
-## ✅ Lab Checklist (6 Tasks)
-
-- [ ] 01 Set up `/tmp/cp-lab` and compare `cp` vs `cp -p` metadata
-- [ ] 02 Recursively copy a directory with `cp -r` and inspect lost metadata
-- [ ] 03 Recopy with `cp -a` and verify mode/owner/group/timestamps/context all match
-- [ ] 04 Practice `-i`, `-n`, `-u`, `-v` safety flags
-- [ ] 05 Work the trailing-slash and `src/.` rules until layout is predictable
-- [ ] 06 Execute the RHCSA capstone — `cp -a /etc/ssh /root/ssh-backup` and verify metadata
-
----
-
-## ⚠️ Common Pitfalls
-
-| Mistake | Symptom | Fix |
+| Plain `cp` | Data only — metadata reset to defaults |
+| `-i` vs `-n` | Interactive prompt vs silent skip |
+| Default mode | Inherits source's mode, masked by umask for new files |
+| Default owner | Calling user, NOT source's owner |
+| Default SELinux | Parent directory's context — that's why labels reset |
+
+| 🪤 Trap Risk | What goes wrong | How to avoid |
 |---|---|---|
-| `cp -r` for backups | Lost metadata | Use `cp -a` |
-| Forgot `-r` on a dir copy | `omitting directory` error | Add `-r` (or `-a`) |
-| `cp -r src dst` when dst exists | Got `dst/src/...` instead of `dst/...` | Use `cp -r src/. dst/` |
-| Plain `cp` of a config under `/etc` | Owner becomes calling user | `cp -a` (and run as root) |
-| Symlinks copied as files | Loss of link semantics | `-a` preserves symlinks (`-d`) |
-| Hard links became two independent files | Disk doubled | `cp -a` preserves hard links |
-| SELinux context lost | Daemon cannot read copy | `cp -a` or `cp --preserve=context` |
-| Used `cp -i` in a script | Interactive prompt hangs the script | Use explicit `-n` or `-f` instead |
-| Used `cp -u` across machines | Clock skew confuses mtime comparisons | Use `rsync -a --checksum` |
-| Used `cp src /target` repeatedly in a loop | Verbose silent overwrites | Add `-v` |
+| **T08-A** | `cp` resets mtime + SELinux + owner | Use `-a` or `--preserve=` (Task 2) |
+| Overwrite-blindness | `cp src dst` silently overwrites existing dst | Use `-i` for interactive, `-n` for skip |
 
----
+### 🔁 Persistence Check
 
-## 🎯 Career & Interview Strategy
+```bash
+test -f /srv/cp-lab/dst/file.txt && echo "file ok"
+diff /srv/cp-lab/src/file.txt /srv/cp-lab/dst/file.txt && echo "data identical"
+stat -c '%y' /srv/cp-lab/src/file.txt
+stat -c '%y' /srv/cp-lab/dst/file.txt   # different
+```
 
-**RHCSA candidate**
-- Train the reflex: when the task says "backup," "preserve permissions," or "with original ownership," type `cp -a`. Verify with `ls -lZ` on both sides.
+### 📓 Journal Write
 
-**RHCE candidate**
-- Ansible: `copy:` with `mode:`, `owner:`, `group:`, and `setype:` reproduces `cp -a` semantics declaratively.
+```bash
+sudo tee /root/rhcsa_journal/lab08/task1/done.txt > /dev/null <<EOF
+lab=08 task=1
+when=$(date -Is)
+practice_dir=/etc/skel
+src_mtime=$(stat -c '%y' /srv/cp-lab/src/file.txt)
+dst_mtime=$(stat -c '%y' /srv/cp-lab/dst/file.txt)
+mtime_preserved=$([ "$(stat -c '%Y' /srv/cp-lab/src/file.txt)" = "$(stat -c '%Y' /srv/cp-lab/dst/file.txt)" ] && echo yes || echo no)
+EOF
+cat /root/rhcsa_journal/lab08/task1/done.txt
+```
 
-**SRE / Platform interview**
-- "Always back up before you change." → `sudo cp -a /etc/CONFIG_FILE /root/CONFIG_FILE.bak-$(date +%F-%H%M)` before any edit. Rollback is a one-line `cp -a` in reverse.
+### 🧹 Cleanup
 
-**DevOps**
-- Dockerfile `COPY` preserves mode only by default; use `--chown=user:group` and `--chmod` (BuildKit) for parity with `cp -a`.
+Leave files; Task 2 reuses the tree.
 
-**AI / MLOps**
-- `cp -a` on a 1 TB dataset is faster than `rsync -a` locally; cross-host, `rsync -aP --partial` resumes.
+### Troubleshoot Table
 
----
-
-## 🔗 Related Labs
-
-| Lab | Connection |
+| Symptom | Fix |
 |---|---|
-| Lab 05 — Directory Navigation | You must know the paths before you copy them |
-| Lab 06 — Listing & SELinux Contexts | The verification side of `cp -a` |
-| Lab 09 — Hard and Soft Links | Behavior of `cp -d` / `cp -a` with links |
-| Lab 10 — Moving and Renaming Files | The sibling of `cp`: same inode, new name |
-| Lab 11 — Safe Deletion | The undo for accidental copies |
+| `cp: cannot create regular file: Permission denied` | Use `sudo` (this whole lab uses root-owned `/srv/cp-lab`) |
+| `cp -i` doesn't prompt | An alias may have stripped it; `\cp -i` or `/usr/bin/cp -i` |
+
+> **STOP — confirm `mtime_preserved=no` in done.txt (that's correct — plain `cp` does NOT preserve mtime).**
 
 ---
 
-## 👤 Author
+## Task 2 — `cp -R` (Recursive) and `cp -a` (Archive — Preserve Everything)
 
-**Kelvin R. Tobias**
-[kelvinintech.com](https://kelvinintech.com) · [GitHub](https://github.com/kelvintechnical) · [LinkedIn](https://www.linkedin.com/in/kelvin-r-tobias-211949219)
+**Practice directory this task:** `/etc/skel` (read), `/srv/cp-lab` (write)
+
+### 🔁 Warm-Up — Commands from Previous Labs
+
+```bash
+sudo mkdir -p /root/rhcsa_journal/lab08/task2
+date -Is | sudo tee /root/rhcsa_journal/lab08/task2/start.txt
+ls -laR /srv/cp-lab/src/ | sudo tee -a /root/rhcsa_journal/lab08/task2/start.txt
+echo "exit was: $?"
+```
+
+### Purpose
+
+Copy a directory tree (including subdirs and a symlink) with `cp -R` and observe that mtime + SELinux + symlinks behave differently. Then re-do with `cp -a` and observe that EVERYTHING (mode, owner, mtime, symlinks, SELinux, xattrs) is preserved.
+
+### Main Command Block
+
+```bash
+# Clean prior dst
+sudo rm -rf /srv/cp-lab/dst-R /srv/cp-lab/dst-a
+
+# cp -R — recursive but does NOT preserve metadata (mtime reset, symlinks followed)
+sudo cp -R /srv/cp-lab/src /srv/cp-lab/dst-R
+ls -laZR /srv/cp-lab/dst-R | head -15
+echo "--- mtime check ---"
+stat -c 'src=%y' /srv/cp-lab/src/file.txt
+stat -c 'dst-R=%y' /srv/cp-lab/dst-R/file.txt
+
+echo "--- symlink check on -R ---"
+ls -l /srv/cp-lab/dst-R/link-to-file        # NOT a symlink in dst-R (because -R follows by default)
+
+# cp -a — archive (preserves: mode, ownership, mtime, symlinks-as-symlinks, SELinux, xattrs)
+sudo cp -a /srv/cp-lab/src /srv/cp-lab/dst-a
+ls -laZR /srv/cp-lab/dst-a | head -15
+echo "--- mtime check ---"
+stat -c 'src=%y' /srv/cp-lab/src/file.txt
+stat -c 'dst-a=%y' /srv/cp-lab/dst-a/file.txt
+
+echo "--- symlink check on -a ---"
+ls -l /srv/cp-lab/dst-a/link-to-file        # IS a symlink
+
+# Capture
+{
+  echo "=== cp -R mtime ==="
+  stat -c 'src=%y' /srv/cp-lab/src/file.txt
+  stat -c 'dst-R=%y' /srv/cp-lab/dst-R/file.txt
+  echo "=== cp -R symlink ==="; ls -l /srv/cp-lab/dst-R/link-to-file
+  echo "=== cp -a mtime ==="
+  stat -c 'src=%y' /srv/cp-lab/src/file.txt
+  stat -c 'dst-a=%y' /srv/cp-lab/dst-a/file.txt
+  echo "=== cp -a symlink ==="; ls -l /srv/cp-lab/dst-a/link-to-file
+  echo "=== cp -a SELinux ==="; ls -dZ /srv/cp-lab/src; ls -dZ /srv/cp-lab/dst-a
+} 2>&1 | sudo tee /root/rhcsa_journal/lab08/task2/transcript.txt
+```
+
+### Human-Readable Breakdown
+
+`cp -R` (capital R) is recursive. It walks subdirectories. But it does NOT preserve metadata — mtime resets, owner becomes you, symlinks get DE-referenced (you get the file pointed to, not the link).
+
+`cp -a` is shorthand for `-dR --preserve=all`. It:
+
+- Preserves mode, ownership, timestamps (`-p`)
+- Preserves symlinks as symlinks (`-d`)
+- Recurses (`-R`)
+- Preserves SELinux context, xattrs, ACLs (`--preserve=all`)
+
+`cp -a` is the **default tool** when staging configuration or doing backups. It's the closest the userspace `cp` gets to a true `rsync -a`.
+
+There's also `cp -p` (preserve mode/ownership/timestamps but NOT symlinks/context/xattrs) and `cp -d` (preserve symlinks, no other preservation). `-a` bundles them all.
+
+### Reading It Left to Right
+
+`cp -R SRC DST`
+
+- `cp` — copy
+- `-R` — recursive (also `-r`, same thing on GNU cp)
+- `SRC` — source directory
+- `DST` — destination
+
+`cp -a SRC DST`
+
+- `cp` — copy
+- `-a` — archive = `-dR --preserve=all`
+
+### The Story
+
+A grader: "Restore the contents of `/var/lib/oldservice/` from `/backup/oldservice/` preserving everything." Plain `cp -R` would break the service (wrong owner, wrong SELinux). `cp -a` is the right tool. RHCSA expects you to reach for `-a` when "preserve everything" is in the question.
+
+### Expected Output
+
+```
+=== cp -R mtime ===
+src=2020-01-15 12:00:00.000000000 -0500
+dst-R=2026-05-27 15:01:00.000000000 -0400          <-- reset to now
+
+=== cp -R symlink ===
+-rw-r--r--. 1 root root 6 May 27 15:01 /srv/cp-lab/dst-R/link-to-file
+                                                    ^^^^^^^^^^^^^^^^^
+                                                    NO `l` — symlink was followed (became a file)
+
+=== cp -a mtime ===
+src=2020-01-15 12:00:00.000000000 -0500
+dst-a=2020-01-15 12:00:00.000000000 -0500          <-- PRESERVED
+
+=== cp -a symlink ===
+lrwxrwxrwx. 1 root root 22 Jan 15  2020 /srv/cp-lab/dst-a/link-to-file -> /srv/cp-lab/src/file.txt
+^                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^
+preserved as symlink                                                    arrow shows the link target
+```
+
+### Switches Table
+
+| Switch | Meaning | Why it matters |
+|---|---|---|
+| `-R` / `-r` | Recursive copy | Required for directories |
+| `-a` | Archive (= `-dR --preserve=all`) | The "preserve everything" answer |
+| `-p` | Preserve mode + ownership + timestamps | A subset of `-a` |
+| `-d` | Preserve symlinks as symlinks | Subset of `-a` |
+| `-L` | Always follow symlinks | Opposite of `-d` |
+| `-P` | Never follow symlinks (default for `-R` on RHEL) | Subset of `-d` |
+
+### 🧠 Concept Card
+
+| Concept | One-Line |
+|---|---|
+| `-R` | Recursive; metadata RESET by default |
+| `-a` | Archive; preserves mode + owner + mtime + symlinks + SELinux + xattrs |
+| `-a` = | `-dR --preserve=all` |
+| When to use `-a` | Backups, config staging, exam-grade "preserve everything" |
+
+| 🪤 Trap Risk | What goes wrong | How to avoid |
+|---|---|---|
+| **T08-A** | `cp -R` resets mtime — you wanted backup but the backup looks "new" | Use `cp -a` |
+| **T08-B** | `cp -R` follows symlinks by default — your backup has the file's contents in place of the link | Use `cp -a` (which implies `-d`) |
+| SELinux drift | `cp -R` resets contexts to parent's default | Use `cp -a` to preserve, or `restorecon -Rv` on destination |
+
+### 🔁 Persistence Check
+
+```bash
+test -f /srv/cp-lab/dst-a/file.txt && echo "dst-a/file ok"
+test -L /srv/cp-lab/dst-a/link-to-file && echo "dst-a/link is symlink"
+test -L /srv/cp-lab/dst-R/link-to-file && echo "dst-R/link is symlink" || echo "dst-R/link is NOT a symlink (followed by -R)"
+[ "$(stat -c '%Y' /srv/cp-lab/src/file.txt)" = "$(stat -c '%Y' /srv/cp-lab/dst-a/file.txt)" ] && echo "mtime preserved by -a"
+```
+
+### 📓 Journal Write
+
+```bash
+sudo tee /root/rhcsa_journal/lab08/task2/done.txt > /dev/null <<EOF
+lab=08 task=2
+when=$(date -Is)
+dst_R_symlink_preserved=$(test -L /srv/cp-lab/dst-R/link-to-file && echo yes || echo no)
+dst_a_symlink_preserved=$(test -L /srv/cp-lab/dst-a/link-to-file && echo yes || echo no)
+dst_a_mtime_match=$([ "$(stat -c '%Y' /srv/cp-lab/src/file.txt)" = "$(stat -c '%Y' /srv/cp-lab/dst-a/file.txt)" ] && echo yes || echo no)
+EOF
+cat /root/rhcsa_journal/lab08/task2/done.txt
+```
+
+### 🧹 Cleanup
+
+Leave both `dst-R` and `dst-a` — Task 3 compares them.
+
+### Troubleshoot Table
+
+| Symptom | Fix |
+|---|---|
+| `cp: -R not specified; omitting directory` | You're copying a directory without `-R` — add it |
+| Symlink in `dst-a` points at non-existent target | The symlink was already broken in `src/` — `ls -l src/` to verify |
+
+> **STOP — confirm `dst_a_symlink_preserved=yes` and `dst_a_mtime_match=yes` in done.txt before Task 3.**
+
+---
+
+## Task 3 — Fine-Grained Control: `cp --preserve=` and `--no-preserve=`
+
+**Practice directory this task:** `/srv/cp-lab` (write)
+
+### 🔁 Warm-Up — Commands from Previous Labs
+
+```bash
+sudo mkdir -p /root/rhcsa_journal/lab08/task3
+date -Is | sudo tee /root/rhcsa_journal/lab08/task3/start.txt
+echo "exit was: $?"
+```
+
+### Purpose
+
+Pick the exact preservation set you want. Use `--preserve=ATTRIBUTES` to enable only those, and `--no-preserve=ATTRIBUTES` to disable them. Valid attributes: `mode`, `ownership`, `timestamps`, `links`, `context`, `xattr`, `all`.
+
+### Main Command Block
+
+```bash
+sudo rm -rf /srv/cp-lab/dst-pref /srv/cp-lab/dst-nopref
+
+# Preserve only mode + timestamps (skip ownership)
+sudo cp -R --preserve=mode,timestamps /srv/cp-lab/src /srv/cp-lab/dst-pref
+ls -lZ /srv/cp-lab/dst-pref/file.txt
+stat -c 'src=%U:%G %a %y' /srv/cp-lab/src/file.txt
+stat -c 'pref=%U:%G %a %y' /srv/cp-lab/dst-pref/file.txt
+
+# cp -a but explicitly DROP ownership preservation
+sudo cp -a --no-preserve=ownership /srv/cp-lab/src /srv/cp-lab/dst-nopref
+ls -lZ /srv/cp-lab/dst-nopref/file.txt
+stat -c 'nopref=%U:%G' /srv/cp-lab/dst-nopref/file.txt
+
+# --preserve=context — SELinux only (useful when DAC is fine but you need labels copied)
+sudo rm -rf /srv/cp-lab/dst-ctx
+sudo cp -R --preserve=context /srv/cp-lab/src /srv/cp-lab/dst-ctx
+ls -lZ /srv/cp-lab/dst-ctx/file.txt
+ls -lZ /srv/cp-lab/src/file.txt
+
+# Capture
+{
+  echo "=== --preserve=mode,timestamps ==="
+  stat -c 'src=%U:%G %a %y' /srv/cp-lab/src/file.txt
+  stat -c 'pref=%U:%G %a %y' /srv/cp-lab/dst-pref/file.txt
+  echo "=== cp -a --no-preserve=ownership ==="
+  stat -c 'src_owner=%U:%G' /srv/cp-lab/src/file.txt
+  stat -c 'nopref_owner=%U:%G' /srv/cp-lab/dst-nopref/file.txt
+  echo "=== --preserve=context (SELinux) ==="
+  ls -Z /srv/cp-lab/src/file.txt
+  ls -Z /srv/cp-lab/dst-ctx/file.txt
+} 2>&1 | sudo tee /root/rhcsa_journal/lab08/task3/transcript.txt
+```
+
+### Human-Readable Breakdown
+
+`--preserve=ATTRIBUTES` is the *only* way to copy SOME but not ALL metadata. The full attribute list:
+
+| Attribute | What it covers |
+|---|---|
+| `mode` | Permission bits (rwx + setuid/setgid/sticky) |
+| `ownership` | uid + gid |
+| `timestamps` | atime + mtime (not ctime — that always updates) |
+| `links` | Symlinks as symlinks (= `-d`) |
+| `context` | SELinux security context |
+| `xattr` | Extended attributes (capabilities, ACLs go through here too) |
+| `all` | Everything above (= what `-a` enables) |
+
+`--no-preserve=` is the negation. Useful when you want `-a` minus one specific thing.
+
+### Reading It Left to Right
+
+`cp -R --preserve=mode,timestamps SRC DST`
+
+- `cp -R` — recursive copy
+- `--preserve=mode,timestamps` — only preserve permission bits and atime/mtime
+- (everything else — owner, symlinks, SELinux — resets to default)
+
+`cp -a --no-preserve=ownership SRC DST`
+
+- `cp -a` — archive (preserve everything by default)
+- `--no-preserve=ownership` — turn OFF ownership preservation
+- (everything else from `-a` still preserved)
+
+### The Story
+
+A grader: "Copy `/etc/X/conf` to `/var/lib/X/conf-backup` preserving timestamps and SELinux labels but allowing the destination to be owned by the calling user." Plain `-a` would also copy ownership; you need `--preserve=timestamps,context`. The fine-grained switches are exam-grade.
+
+### Expected Output
+
+```
+=== --preserve=mode,timestamps ===
+src=root:root 644 2020-01-15 12:00:00.000000000 -0500
+pref=root:root 644 2020-01-15 12:00:00.000000000 -0500
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                  mtime + mode preserved; owner happens to be root because we ran with sudo
+
+=== cp -a --no-preserve=ownership ===
+src_owner=root:root
+nopref_owner=root:root           <-- still root because we ran with sudo and source owner is root
+
+=== --preserve=context (SELinux) ===
+unconfined_u:object_r:var_t:s0   /srv/cp-lab/src/file.txt
+unconfined_u:object_r:var_t:s0   /srv/cp-lab/dst-ctx/file.txt
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                  context preserved
+```
+
+### Switches Table
+
+| Switch | Meaning | Why it matters |
+|---|---|---|
+| `--preserve=mode,timestamps` | Only mode + atime + mtime | Subset of `-a` |
+| `--preserve=context` | Only SELinux context | Useful when DAC reset is fine |
+| `--preserve=xattr` | xattrs (carries ACLs) | Required when source has ACLs |
+| `--preserve=all` | Everything (= `-a`) | Explicit version of `-a` |
+| `--no-preserve=ownership` | Turn off one attribute | Pair with `-a` for "everything except X" |
+
+### 🧠 Concept Card
+
+| Concept | One-Line |
+|---|---|
+| `--preserve=X,Y,Z` | Enumerate exactly what to preserve |
+| `--no-preserve=X` | Negation; pair with `-a` |
+| Attribute set | `mode`, `ownership`, `timestamps`, `links`, `context`, `xattr`, `all` |
+| `cp -a` ≡ | `cp -dR --preserve=all` |
+
+| 🪤 Trap Risk | What goes wrong | How to avoid |
+|---|---|---|
+| Default cp loses ACLs | If source has setfacl entries, plain `cp -p` won't copy them | Use `--preserve=xattr` or `-a` |
+| `--preserve=context` requires SELinux | On disabled-SELinux systems it's a no-op | Check `getenforce` |
+
+### 🔁 Persistence Check
+
+```bash
+diff -r /srv/cp-lab/src /srv/cp-lab/dst-a >/dev/null && echo "dst-a is bit-identical to src"
+[ "$(stat -c '%Y' /srv/cp-lab/src/file.txt)" = "$(stat -c '%Y' /srv/cp-lab/dst-pref/file.txt)" ] && echo "mtime preserved on dst-pref"
+```
+
+### 📓 Journal Write
+
+```bash
+sudo tee /root/rhcsa_journal/lab08/task3/done.txt > /dev/null <<EOF
+lab=08 task=3
+when=$(date -Is)
+preserve_demo=mode+timestamps,no-ownership,context
+diff_clean=$(diff -r /srv/cp-lab/src /srv/cp-lab/dst-a >/dev/null && echo yes || echo no)
+mtime_pref_match=$([ "$(stat -c '%Y' /srv/cp-lab/src/file.txt)" = "$(stat -c '%Y' /srv/cp-lab/dst-pref/file.txt)" ] && echo yes || echo no)
+EOF
+cat /root/rhcsa_journal/lab08/task3/done.txt
+```
+
+### 🧹 Cleanup
+
+Leave the four `dst-*` directories — Task 5 verifies them.
+
+### Troubleshoot Table
+
+| Symptom | Fix |
+|---|---|
+| `cp: invalid argument --preserve=foo` | `foo` is not a valid attribute — see Switches Table |
+| Context not preserved on RHEL | Confirm SELinux enabled (`getenforce`) — Disabled drops the operation silently |
+
+> **STOP — confirm `diff_clean=yes` in done.txt before Task 4.**
+
+---
+
+## Task 4 — Ansible: `ansible.builtin.copy` with Preserve / Mode / Owner
+
+**Practice directory this task:** `/srv/cp-lab` (sandbox)
+
+### 🔁 Warm-Up — Commands from Previous Labs
+
+```bash
+sudo mkdir -p /root/rhcsa_journal/lab08/task4/playbooks
+date -Is | sudo tee /root/rhcsa_journal/lab08/task4/start.txt
+ansible --version | head -1 | sudo tee -a /root/rhcsa_journal/lab08/task4/start.txt
+echo "exit was: $?"
+```
+
+### Purpose
+
+Replicate Tasks 1–3 with `ansible.builtin.copy`. Set explicit `mode:`, `owner:`, `group:`. Use `remote_src: true` because the source is already on the target machine (localhost), not on the control node. Prove idempotence: second run = `changed=0`.
+
+### Main Command Block
+
+Write the playbook:
+
+```bash
+sudo tee /root/rhcsa_journal/lab08/task4/playbooks/copy.yml > /dev/null <<'EOF'
+---
+- name: Lab 08 Task 4 — copy a file via ansible.builtin.copy
+  hosts: localhost
+  become: true
+  gather_facts: false
+
+  vars:
+    src_file: /srv/cp-lab/src/file.txt
+    dst_file: /srv/cp-lab/dst-ansible/file.txt
+    dst_dir: /srv/cp-lab/dst-ansible
+
+  tasks:
+    - name: Ensure destination directory exists
+      ansible.builtin.file:
+        path: "{{ dst_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy file with explicit mode + owner + group
+      ansible.builtin.copy:
+        src: "{{ src_file }}"
+        dest: "{{ dst_file }}"
+        remote_src: true       # source is on the target, not the control node
+        owner: root
+        group: root
+        mode: '0644'
+      register: copy_result
+
+    - name: Show what changed
+      ansible.builtin.debug:
+        msg:
+          - "copy changed: {{ copy_result.changed }}"
+          - "dest: {{ copy_result.dest }}"
+          - "checksum: {{ copy_result.checksum | default('n/a') }}"
+EOF
+```
+
+Check-mode first:
+
+```bash
+ansible-playbook --check --diff /root/rhcsa_journal/lab08/task4/playbooks/copy.yml \
+  2>&1 | sudo tee /root/rhcsa_journal/lab08/task4/check.log
+```
+
+Apply:
+
+```bash
+ansible-playbook /root/rhcsa_journal/lab08/task4/playbooks/copy.yml \
+  2>&1 | sudo tee /root/rhcsa_journal/lab08/task4/apply.log
+```
+
+Idempotence proof:
+
+```bash
+ansible-playbook /root/rhcsa_journal/lab08/task4/playbooks/copy.yml \
+  2>&1 | sudo tee /root/rhcsa_journal/lab08/task4/rerun.log
+grep '^localhost' /root/rhcsa_journal/lab08/task4/rerun.log
+```
+
+Second run must show `changed=0` on the copy task. If it's `changed=1`, the file is genuinely different — investigate with `diff`.
+
+### Human-Readable Breakdown
+
+`ansible.builtin.copy` is the file-copy module. The most-used arguments:
+
+| Argument | Maps to |
+|---|---|
+| `src:` | Source path (control node by default — see `remote_src:`) |
+| `dest:` | Destination path on the target |
+| `mode:`, `owner:`, `group:` | Explicit DAC — set unconditionally on dest |
+| `remote_src: true` | Source is on the target, not the control node |
+| `preserve: true` | Preserve mode and timestamps from source (like `cp -p`) |
+| `force: false` | Don't overwrite if dest exists (like `cp -n`) |
+| `backup: true` | Save backup of overwritten file (like `cp -b`) |
+| `checksum:` | If you provide a checksum, the module only copies when current dest != checksum |
+
+`remote_src: true` is the critical RHCE-grade switch on localhost-style labs. Without it, Ansible would look for `/srv/cp-lab/src/file.txt` on the **control node**, not on the **target**. Since they are the same machine in this lab, it usually still works — but writing `remote_src: true` is the correct and RHCE-defensible form.
+
+### Reading It Left to Right
+
+```yaml
+ansible.builtin.copy:
+  src: /srv/cp-lab/src/file.txt
+  dest: /srv/cp-lab/dst-ansible/file.txt
+  remote_src: true
+  owner: root
+  group: root
+  mode: '0644'
+```
+
+- `ansible.builtin.copy:` — FQCN of the copy module
+- `src:` — source path (resolved as remote because of `remote_src:`)
+- `dest:` — destination path on the target
+- `remote_src: true` — "src is already on the target"
+- `owner:`, `group:` — DAC
+- `mode:` — quoted octal
+
+### The Story
+
+A grader: "On host X, copy `/etc/template.conf` to `/etc/myservice/conf` owned by root:root, mode 0640." The Ansible answer is `ansible.builtin.copy` with `src:`, `dest:`, `owner:`, `group:`, `mode:`, and `remote_src: true` (because the template lives on the target, not on the controller). Second run reports `changed=0` because the file already matches.
+
+### Expected Output
+
+First apply:
+
+```
+TASK [Ensure destination directory exists] ***
+changed: [localhost]
+
+TASK [Copy file with explicit mode + owner + group] ***
+changed: [localhost]
+
+TASK [Show what changed] ***
+ok: [localhost] => msg: ["copy changed: True", "dest: /srv/cp-lab/dst-ansible/file.txt", ...]
+
+PLAY RECAP ***
+localhost : ok=3 changed=2 unreachable=0 failed=0
+```
+
+Idempotence rerun:
+
+```
+TASK [Copy file with explicit mode + owner + group] ***
+ok: [localhost]                    <-- NOT changed; content + mode + owner all match
+
+PLAY RECAP ***
+localhost : ok=3 changed=0 unreachable=0 failed=0
+```
+
+### Switches Table
+
+| Switch / Key | Meaning | Why it matters |
+|---|---|---|
+| `ansible.builtin.copy:` | FQCN of the copy module | RHCE answer for `cp` |
+| `src:` | Source path | Control node by default |
+| `dest:` | Destination path on target | Always required |
+| `remote_src: true` | Source is on the target | Required when src already on target |
+| `owner:`, `group:`, `mode:` | DAC, explicit | Set unconditionally |
+| `preserve: true` | Preserve mode + timestamps from src | Equivalent to `cp -p` |
+| `backup: true` | Save backup of overwritten dest | Safety net |
+| `force: false` | Don't overwrite existing | Equivalent to `cp -n` |
+| `validate:` | Run a command to validate before final move | Best practice for `sshd_config` etc |
+
+### 🧠 Concept Card
+
+| Concept | One-Line |
+|---|---|
+| `ansible.builtin.copy` | RHCE module for file copy + permission set + ownership set |
+| `remote_src: true` | "src is on the target, not on the control node" |
+| Idempotence | Module checksums dest; second run = changed=0 if content + meta match |
+| `preserve:` | Equivalent of `cp -p` (mode + timestamps from source) |
+
+| 🪤 Trap Risk | What goes wrong | How to avoid |
+|---|---|---|
+| **Wrapping `command: cp` instead of using `ansible.builtin.copy`** | RHCE cardinal sin | Use the module |
+| **T08-C** | Forgetting `remote_src: true`, source resolved on control node and not found | Always set `remote_src: true` when the source is on the target |
+| `mode: 0644` unquoted | YAML parses as decimal | Quote it: `mode: '0644'` |
+| Not setting `validate:` for service configs | Bad sshd_config locks you out | Pass `validate: '/usr/sbin/sshd -tf %s'` on sshd_config copies |
+
+### 🔁 Persistence Check
+
+```bash
+test -f /srv/cp-lab/dst-ansible/file.txt && echo "dst-ansible/file.txt ok"
+diff /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt && echo "content matches"
+stat -c 'mode=%a owner=%U:%G' /srv/cp-lab/dst-ansible/file.txt
+grep -c 'changed=0' /root/rhcsa_journal/lab08/task4/rerun.log
+```
+
+### 📓 Journal Write
+
+```bash
+sudo tee /root/rhcsa_journal/lab08/task4/done.txt > /dev/null <<EOF
+lab=08 task=4
+when=$(date -Is)
+playbook=/root/rhcsa_journal/lab08/task4/playbooks/copy.yml
+dst_mode=$(stat -c '%a' /srv/cp-lab/dst-ansible/file.txt)
+dst_owner=$(stat -c '%U:%G' /srv/cp-lab/dst-ansible/file.txt)
+diff_clean=$(diff /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt >/dev/null && echo yes || echo no)
+idempotent=$(grep -c 'changed=0' /root/rhcsa_journal/lab08/task4/rerun.log)
+EOF
+cat /root/rhcsa_journal/lab08/task4/done.txt
+```
+
+### 🧹 Cleanup
+
+Leave files; Task 5 verifies them.
+
+### Troubleshoot Table
+
+| Symptom | Fix |
+|---|---|
+| `Could not find or access SRC` | `src:` resolved on control node — add `remote_src: true` |
+| Second run shows `changed=1` | mode/owner/group probably don't match — `stat` dest manually |
+| `Permission denied` writing dest | `become: true` missing |
+
+> **STOP — confirm `idempotent=1` (count of `changed=0` lines) in done.txt before Task 5.**
+
+---
+
+## Task 5 — RHCSA Verification Capstone: Prove the Copy is Byte- and Metadata-Identical
+
+**Practice directory this task:** `/srv/cp-lab` (sandbox)
+
+### 🔁 Warm-Up — Commands from Previous Labs
+
+```bash
+sudo mkdir -p /root/rhcsa_journal/lab08/task5
+date -Is | sudo tee /root/rhcsa_journal/lab08/task5/start.txt
+echo "exit was: $?"
+```
+
+### Purpose
+
+Use **only** RHCSA inspection commands (no `ansible` CLI) to prove:
+
+1. The destination is **byte-identical** to the source (`diff` or `cmp`)
+2. The mode + owner + group match the playbook
+3. The SELinux context is appropriate for the destination
+
+### Main Command Block
+
+Three+ RHCSA inspection commands:
+
+```bash
+# 1) Byte-identical comparison
+diff /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt && echo "DIFF_CLEAN"
+cmp /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt && echo "CMP_CLEAN"
+md5sum /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt
+
+# 2) Metadata comparison
+stat -c 'mode=%a owner=%U:%G size=%s' /srv/cp-lab/src/file.txt
+stat -c 'mode=%a owner=%U:%G size=%s' /srv/cp-lab/dst-ansible/file.txt
+
+# 3) SELinux context comparison
+ls -lZ /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt
+matchpathcon /srv/cp-lab/dst-ansible/file.txt
+
+# 4) ACL comparison (RHCSA-grade — usually no ACLs but verify)
+getfacl /srv/cp-lab/src/file.txt
+getfacl /srv/cp-lab/dst-ansible/file.txt
+
+# 5) Recursive tree comparison (for the cp -a backup)
+diff -r /srv/cp-lab/src /srv/cp-lab/dst-a >/dev/null && echo "TREE_DIFF_CLEAN"
+
+# Capture
+{
+  echo "=== diff src vs dst-ansible ==="
+  diff /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt && echo "CLEAN" || echo "DIFFERENT"
+  echo "=== md5 ==="
+  md5sum /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt
+  echo "=== mode+owner ==="
+  echo "src: $(stat -c 'mode=%a owner=%U:%G' /srv/cp-lab/src/file.txt)"
+  echo "dst: $(stat -c 'mode=%a owner=%U:%G' /srv/cp-lab/dst-ansible/file.txt)"
+  echo "=== SELinux ==="; ls -lZ /srv/cp-lab/src/file.txt /srv/cp-lab/dst-ansible/file.txt
+  echo "=== tree (cp -a) ==="
+  diff -r /srv/cp-lab/src /srv/cp-lab/dst-a >/dev/null 2>&1 && echo "TREE_MATCH" || echo "TREE_DIFFER"
+} 2>&1 | sudo tee /root/rhcsa_journal/lab08/task5/evidence.txt
+```
+
+### Human-Readable Breakdown
+
+`diff FILE1 FILE2` — line-level diff; clean exit if identical
+`cmp FILE1 FILE2` — byte-level binary comparison; clean exit if identical
+`md5sum` — checksum compare; same hash = same content
+`stat -c FMT` — metadata snapshot
+`ls -lZ` — DAC + SELinux
+`diff -r DIR1 DIR2` — recursive directory diff (the big one for `cp -a`)
+
+These are the five tools a grader uses to audit a copy operation. Run them yourself first.
+
+### Reading It Left to Right
+
+`diff -r /srv/cp-lab/src /srv/cp-lab/dst-a >/dev/null`
+
+- `diff` — diff tool
+- `-r` — recursive
+- `/srv/cp-lab/src` — left side
+- `/srv/cp-lab/dst-a` — right side
+- `>/dev/null` — discard output; just check exit code
+
+`md5sum FILE1 FILE2`
+
+- `md5sum` — MD5 checksum
+- Two arguments → prints both checksums, one per line
+
+### The Story
+
+You hand a grader `evidence.txt` and it reads: "diff is clean, md5 matches, mode is identical (644), owner is identical (root:root), SELinux contexts agree, and the recursive tree diff for `cp -a` is also clean." That's the auditor's full report.
+
+### Expected Output
+
+```
+=== diff src vs dst-ansible ===
+CLEAN
+
+=== md5 ===
+b1946ac92492d2347c6235b4d2611184  /srv/cp-lab/src/file.txt
+b1946ac92492d2347c6235b4d2611184  /srv/cp-lab/dst-ansible/file.txt
+
+=== mode+owner ===
+src: mode=644 owner=root:root
+dst: mode=644 owner=root:root
+
+=== SELinux ===
+-rw-r--r--. 1 root root unconfined_u:object_r:var_t:s0 6 ... src/file.txt
+-rw-r--r--. 1 root root unconfined_u:object_r:var_t:s0 6 ... dst-ansible/file.txt
+
+=== tree (cp -a) ===
+TREE_MATCH
+```
+
+### Switches Table
+
+| Switch | Meaning | Why it matters |
+|---|---|---|
+| `diff FILE1 FILE2` | Line-level diff | Quick content check |
+| `cmp FILE1 FILE2` | Byte-level compare | Binary-safe |
+| `md5sum FILE` | Checksum | Network-safe verification |
+| `diff -r DIR1 DIR2` | Recursive directory diff | For `cp -a` style copies |
+| `ls -lZ` | DAC + SELinux in one row | Auditor primary view |
+| `getfacl PATH` | ACL inspection | If source had ACLs |
+
+### 🧠 Concept Card
+
+| Concept | One-Line |
+|---|---|
+| Verification triangle | `diff` (content) + `stat` (metadata) + `ls -lZ` (DAC + SELinux) |
+| Reboot reasoning | `/srv/` survives reboot (real filesystem); state changes persist |
+| Auditor reflex | Always verify with ≥3 RHCSA inspection commands; check content AND meta |
+
+| 🪤 Trap Risk | What goes wrong | How to avoid |
+|---|---|---|
+| **Trusting `ansible-playbook`'s changed=1 without inspecting state** | Whole point of the verification capstone | Always run `diff` + `stat` + `ls -lZ` |
+| Skipping `diff -r` for tree copies | Tree differ in one nested file you don't notice | Always `diff -r` for `cp -a` style backups |
+
+### 🔁 Persistence Check (Reboot Reasoning)
+
+```bash
+echo "REBOOT REASONING:"                                                                | sudo tee /root/rhcsa_journal/lab08/task5/reboot.txt
+echo "1. /srv/ is a normal filesystem path. Files persist across reboot."              | sudo tee -a /root/rhcsa_journal/lab08/task5/reboot.txt
+echo "2. SELinux context survives because policy applies it at boot."                  | sudo tee -a /root/rhcsa_journal/lab08/task5/reboot.txt
+echo "3. The Ansible playbook itself persists in /root/rhcsa_journal/."                | sudo tee -a /root/rhcsa_journal/lab08/task5/reboot.txt
+test -f /root/rhcsa_journal/lab08/task4/playbooks/copy.yml && echo "playbook persists" | sudo tee -a /root/rhcsa_journal/lab08/task5/reboot.txt
+test -f /srv/cp-lab/dst-ansible/file.txt && echo "dst persists"                        | sudo tee -a /root/rhcsa_journal/lab08/task5/reboot.txt
+```
+
+### 📓 Journal Write
+
+```bash
+sudo tee /root/rhcsa_journal/lab08/task5/done.txt > /dev/null <<EOF
+lab=08 task=5
+when=$(date -Is)
+evidence=/root/rhcsa_journal/lab08/task5/evidence.txt
+reboot=/root/rhcsa_journal/lab08/task5/reboot.txt
+clean_diff=$(grep -c '^CLEAN$' /root/rhcsa_journal/lab08/task5/evidence.txt)
+tree_match=$(grep -c '^TREE_MATCH$' /root/rhcsa_journal/lab08/task5/evidence.txt)
+status=lab08-complete
+EOF
+cat /root/rhcsa_journal/lab08/task5/done.txt
+```
+
+### 🧹 Cleanup (No Regression)
+
+```bash
+# Remove the sandbox entirely
+sudo rm -rf /srv/cp-lab
+ls -d /srv/cp-lab 2>&1 | grep -q "No such" && echo "sandbox cleaned"
+
+# Journal stays
+ls /root/rhcsa_journal/lab08/
+```
+
+### Troubleshoot Table
+
+| Symptom | Fix |
+|---|---|
+| `diff` reports a difference | Re-run Task 4 — `src:` likely pointed at a different file |
+| `TREE_DIFFER` | One file in the tree diverged — run `diff -r` without `>/dev/null` to find which |
+
+> **STOP — record `status=lab08-complete` in done.txt. Lab 08 is finished.**
+
+---
+
+## ✅ Lab 08 Complete When
+
+```bash
+ls /root/rhcsa_journal/lab08/task{1,2,3,4,5}/done.txt
+grep -l 'lab08-complete' /root/rhcsa_journal/lab08/task5/done.txt
+test -f /root/rhcsa_journal/lab08/task4/playbooks/copy.yml
+grep -c 'CLEAN' /root/rhcsa_journal/lab08/task5/evidence.txt
+```
+
+All four checks must succeed. You can `cp` files by hand, choose the right preservation profile, replicate with `ansible.builtin.copy`, and audit with `diff`/`stat`/`ls -lZ`.
